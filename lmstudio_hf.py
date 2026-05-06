@@ -65,15 +65,21 @@ def get_key():
     """Get a single keypress from the user.
 
     Handles single-byte keys plus the common ANSI escape sequences:
-      \\x1b[A/B/C/D     arrow keys (3 bytes)
-      \\x1b[3~          Delete / Forward Delete (4 bytes)
-      \\x1b[5~/[6~      PageUp / PageDown (4 bytes)
-      \\x1b[H / [F      Home / End (3 bytes)
+      \\x1b           bare ESC (cancel)
+      \\x1b[A/B/C/D   arrow keys (3 bytes)
+      \\x1b[3~        Delete / Forward Delete (4 bytes)
+      \\x1b[5~/[6~    PageUp / PageDown (4 bytes)
+      \\x1b[H / [F    Home / End (3 bytes)
 
-    Generic rule: after ESC + '[', if the third byte is a digit, keep
-    reading until we hit a non-digit terminator (~, A-Z).
+    Bare ESC vs ESC-prefixed sequence is disambiguated by a 50ms timeout:
+    if no follow-up byte arrives, the keypress is treated as bare ESC.
+    Without this, ESC alone would block forever waiting for a non-existent
+    second byte.
+
+    After ESC + '[', if the third byte is a digit, keep reading until we
+    hit a non-digit terminator (~, A-Z).
     """
-    import tty, termios
+    import tty, termios, select
 
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
@@ -81,10 +87,16 @@ def get_key():
         tty.setraw(sys.stdin.fileno())
         ch = sys.stdin.read(1)
         if ch == "\x1b":
+            # Peek for an immediate follow-up byte; if none, this is bare ESC.
+            ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+            if not ready:
+                return "\x1b"
             ch += sys.stdin.read(2)
-            # If the sequence is ESC [ <digit>, keep reading until terminator.
             if len(ch) == 3 and ch[-1].isdigit():
                 while True:
+                    ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+                    if not ready:
+                        break
                     nxt = sys.stdin.read(1)
                     ch += nxt
                     if not nxt.isdigit():
@@ -856,18 +868,34 @@ def curate_entries(entries):
                     cur["decision"] = "redundant"
                     cur["reason"] = f"same slot ({slot}) already filled by a higher-ranked keeper"
 
+_HEX_SHA = re.compile(r"^[0-9a-f]{6,64}$")
+
 def enrich_entry(entry, snapshot_path=None):
     """Augment a discovered-item record with parsed metadata.
 
-    Mutates the entry in place by adding an `enrichment` field containing
-    fields from parse_model_id(entry['id']) plus, if a snapshot_path is
-    supplied and accessible, the chat_template fingerprint.
+    Mutates the entry in place by adding an `enrichment` field containing:
+      - all fields from parse_model_id(entry['id'])
+      - chat_template fingerprint (when snapshot_path is supplied)
+      - a quantization fallback derived from config.json or GGUF filename
+        when the name didn't carry a recognizable quant token
+      - local_sha (the snapshot dir name, when it looks like a git sha)
+        so curation can later compare it against the Hub's current sha
     """
     parsed = parse_model_id(entry.get("id") or "")
     if snapshot_path is not None:
         parsed["chat_template"] = chat_template_fingerprint(snapshot_path)
+        if not parsed.get("quantization"):
+            parsed["quantization"] = detect_quantization_from_files(snapshot_path)
+        # HF cache snapshots are named after the commit sha. For dirs that
+        # don't follow that convention (e.g. an LM Studio non-symlinked
+        # model dir), skip — local_sha stays None.
+        if snapshot_path.name and _HEX_SHA.match(snapshot_path.name):
+            parsed["local_sha"] = snapshot_path.name
+        else:
+            parsed["local_sha"] = None
     else:
         parsed["chat_template"] = None
+        parsed["local_sha"] = None
     entry["enrichment"] = parsed
     return entry
 
@@ -921,6 +949,16 @@ def _collect_hf_blob_hashes(hub_dir):
             if blob.is_file():
                 hashes.add(blob.name)
     return hashes
+
+def _local_lfs_shas(hub_dir, publisher, repo):
+    """Return the set of blob filenames (== LFS sha256 hex) present locally
+    for one HF cache repo. Used to detect "Hub has files we don't have
+    locally" — i.e. someone re-uploaded a model file with different bytes
+    since the last time we synced."""
+    blobs_dir = hub_dir / f"models--{publisher}--{repo}" / "blobs"
+    if not blobs_dir.exists():
+        return frozenset()
+    return frozenset(b.name for b in blobs_dir.iterdir() if b.is_file())
 
 def scan_ollama_models(ollama_dir, app_name="Ollama", hf_blob_hashes=None):
     """Walk Ollama-format manifests and yield records per tag.
@@ -1203,6 +1241,58 @@ def parse_model_id(repo_id):
         out["training"] = "dpo"
 
     return out
+
+def detect_quantization_from_files(snapshot_path):
+    """Inspect files in snapshot_path to determine quantization when name parsing failed.
+
+    Two fallbacks, in order:
+      1. config.json — look for an explicit `quantization` / `quantization_config`
+         dict (bitsandbytes / GPTQ / MLX / AWQ all set this) or for `torch_dtype`
+         indicating fp precision (bfloat16 → bf16, float16 → fp16, etc.).
+      2. *.gguf filenames — GGUF files carry the quant in the filename suffix
+         (e.g. `gemma-4-26B-A4B-it-Q4_K_M.gguf`); match against _QUANT_PATTERNS.
+
+    Returns the detected quant label or None if no signal found.
+    """
+    if not snapshot_path or not snapshot_path.exists() or not snapshot_path.is_dir():
+        return None
+    cfg_path = snapshot_path / "config.json"
+    if cfg_path.exists():
+        try:
+            with open(cfg_path) as f:
+                config = json.load(f)
+        except Exception:
+            config = None
+        if isinstance(config, dict):
+            qcfg = config.get("quantization") or config.get("quantization_config")
+            if isinstance(qcfg, dict):
+                bits = qcfg.get("bits") or qcfg.get("nbits")
+                if isinstance(bits, int) and bits > 0:
+                    return f"{bits}bit"
+                method = qcfg.get("quant_method") or qcfg.get("method")
+                if isinstance(method, str) and method:
+                    return method.lower()
+            dtype = config.get("torch_dtype")
+            if isinstance(dtype, str):
+                d = dtype.lower()
+                if d in ("bfloat16", "bf16"):
+                    return "bf16"
+                if d in ("float16", "fp16", "half"):
+                    return "fp16"
+                if d in ("float32", "fp32", "float"):
+                    return "fp32"
+    try:
+        for f in snapshot_path.iterdir():
+            if not f.is_file():
+                continue
+            name = f.name.lower()
+            if name.endswith(".gguf"):
+                for label, pat in _QUANT_PATTERNS:
+                    if re.search(pat, name):
+                        return label
+    except OSError:
+        pass
+    return None
 
 def chat_template_fingerprint(snapshot_path):
     """Return a short sha256 prefix of the tokenizer's chat_template, or None.
@@ -1729,7 +1819,7 @@ def format_discovery_report(sections, ad_hoc, mdfind_total, already_known, mdfin
             lines.append(f"    {kind} / {label}: {n} file{'' if n == 1 else 's'} · {_human_size(sz)}")
     return "\n".join(lines)
 
-def _enrich_with_hub_metadata(sections):
+def _enrich_with_hub_metadata(sections, hub_dir=None):
     """Augment HF-derived items with authoritative metadata from the Hub.
 
     Extracts and applies, for each HF-resolved repo:
@@ -1827,9 +1917,13 @@ def _enrich_with_hub_metadata(sections):
             "library_name": None, "pipeline_tag": None,
             "tags": [], "alignment": None,
             "base_model": None, "model_type": None,
+            "hub_sha": None, "hub_lfs_shas": frozenset(),
         }
         try:
-            info = api.model_info(repo_id)
+            # files_metadata=True so we can compare the Hub's LFS sha256s
+            # to the local blob set and detect "model file replaced
+            # entirely on the Hub" — distinct from a generic commit bump.
+            info = api.model_info(repo_id, files_metadata=True)
         except (RepositoryNotFoundError, GatedRepoError):
             cache[repo_id] = result
             return result
@@ -1838,6 +1932,7 @@ def _enrich_with_hub_metadata(sections):
             return result
         if getattr(info, "last_modified", None):
             result["last_modified"] = info.last_modified.date().isoformat()
+        result["hub_sha"] = getattr(info, "sha", None)
         result["library_name"] = getattr(info, "library_name", None)
         result["pipeline_tag"] = getattr(info, "pipeline_tag", None)
         tags = list(getattr(info, "tags", []) or [])
@@ -1846,6 +1941,14 @@ def _enrich_with_hub_metadata(sections):
         result["model_type"] = _detect_architecture_from_tags(tags)
         result["purpose"] = _detect_purpose_from_tags(tags, result["pipeline_tag"])
         result["capabilities"] = _detect_capabilities_from_tags(tags, result["pipeline_tag"])
+        # Collect every LFS sha256 the current head expects. For a non-LFS
+        # text file (config.json, etc.) lfs is None — those don't contribute.
+        lfs_shas = set()
+        for sib in (getattr(info, "siblings", None) or []):
+            sha = _lfs_sha256(sib)
+            if sha:
+                lfs_shas.add(sha)
+        result["hub_lfs_shas"] = frozenset(lfs_shas)
         cd = getattr(info, "card_data", None)
         if cd is not None:
             cd_dict = cd.to_dict() if hasattr(cd, "to_dict") else dict(cd)
@@ -1890,6 +1993,8 @@ def _enrich_with_hub_metadata(sections):
         enr["pipeline_tag"] = meta["pipeline_tag"]
         enr["base_model"] = meta["base_model"]
         enr["model_type"] = meta["model_type"]
+        enr["hub_sha"] = meta["hub_sha"]
+        enr["hub_lfs_shas"] = meta["hub_lfs_shas"]
         # Authoritative overrides — only when HF actually returned a value;
         # otherwise leave the heuristic-parsed field in place as fallback.
         # library_name is the runner/runtime, NOT a file format. mflux,
@@ -1915,6 +2020,12 @@ def _enrich_with_hub_metadata(sections):
                 if c not in existing:
                     existing.append(c)
             enr["capabilities"] = existing
+        # Compute local LFS sha set so the static grid / picker can flag
+        # entries where the Hub has bytes we don't. Cheap directory listing;
+        # only relevant for HF-cache-format storage.
+        if hub_dir is not None and "/" in repo_id:
+            pub, name = repo_id.split("/", 1)
+            enr["local_lfs_shas"] = _local_lfs_shas(hub_dir, pub, name)
 
 _DECISION_TAG = {
     "keep":      "keep",
@@ -2120,11 +2231,34 @@ def _identity_string(enr):
     return " ".join(parts) if parts else "(unknown)"
 
 # Column widths for the curation grid + interactive picker. Chosen so the
-# grid fits in ~150 cols; values that would overflow are explicitly
+# grid fits in ~170 cols; values that would overflow are explicitly
 # truncated at render time so subsequent columns stay aligned.
-_GRID_W_ID, _GRID_W_RUN, _GRID_W_QUANT, _GRID_W_SIZE, _GRID_W_UPD, _GRID_W_CT, _GRID_W_DEC, _GRID_W_FROM = (
-    46, 12, 11, 8, 11, 8, 10, 32
+_GRID_W_ID, _GRID_W_RUN, _GRID_W_QUANT, _GRID_W_SIZE, _GRID_W_UPD, _GRID_W_CT, _GRID_W_HUB, _GRID_W_DEC, _GRID_W_FROM = (
+    46, 12, 11, 8, 11, 8, 3, 10, 32
 )
+
+def _hub_status_icon(enr):
+    """Return a short icon describing this entry's local-vs-Hub state, or ' '.
+
+    ↥ (upgrade)  Hub has at least one LFS file with a sha256 our local cache
+                 doesn't have — i.e. the model file itself was re-uploaded.
+                 Strong signal: a re-pull would replace bytes.
+    ↻ (refresh)  Hub's commit sha differs from the local snapshot's, but the
+                 LFS file set is unchanged. Likely a metadata/README/tokenizer
+                 update; bytes-on-disk would be unaffected by a re-pull.
+    ' ' (blank)  In sync OR not enough Hub data fetched to compare (no
+                 --hub-meta, gated/private repo, network failure, or this
+                 entry isn't HF-cache-shaped).
+    """
+    hub_lfs = enr.get("hub_lfs_shas")
+    local_lfs = enr.get("local_lfs_shas")
+    if hub_lfs and local_lfs is not None and not hub_lfs.issubset(local_lfs):
+        return "↥"
+    hub_sha = enr.get("hub_sha")
+    local_sha = enr.get("local_sha")
+    if hub_sha and local_sha and hub_sha != local_sha:
+        return "↻"
+    return " "
 
 def _grid_sort_key_for_pair(pair):
     """Sort hierarchy within a purpose group, most-significant first:
@@ -2248,6 +2382,7 @@ def _format_grid_row_content(row, tool_codes):
     updated = (enr.get("last_modified") or "")[:_GRID_W_UPD]
     ct = enr.get("chat_template")
     ct_short = (ct[:8] if ct else "")
+    hub = _hub_status_icon(enr)
     decision = (cur.get("decision") or "—")[:_GRID_W_DEC]
     bm = enr.get("base_model") or ""
     if len(bm) > _GRID_W_FROM:
@@ -2264,7 +2399,7 @@ def _format_grid_row_content(row, tool_codes):
     return (
         f"{ident:<{_GRID_W_ID}} {runner:<{_GRID_W_RUN}} {quant:<{_GRID_W_QUANT}} "
         f"{size_h:>{_GRID_W_SIZE}} {updated:<{_GRID_W_UPD}} {ct_short:<{_GRID_W_CT}} "
-        f"{tool_marks}  {decision:<{_GRID_W_DEC}} {bm}"
+        f"{tool_marks}  {hub:^{_GRID_W_HUB}} {decision:<{_GRID_W_DEC}} {bm}"
     )
 
 def format_curation_grid(sections, ad_hoc):
@@ -2294,13 +2429,14 @@ def format_curation_grid(sections, ad_hoc):
                 f"  {'Identity':<{_GRID_W_ID}} {'Runner':<{_GRID_W_RUN}} "
                 f"{'Quant':<{_GRID_W_QUANT}} {'Size':>{_GRID_W_SIZE}} "
                 f"{'Updated':<{_GRID_W_UPD}} {'CT':<{_GRID_W_CT}} {tool_header}  "
-                f"{'Decision':<{_GRID_W_DEC}} From"
+                f"{'Hub':^{_GRID_W_HUB}} {'Decision':<{_GRID_W_DEC}} From"
             )
             out.append("  " + "─" * 150)
         else:
             out.append("  " + _format_grid_row_content(r, tool_codes))
     out.append("")
     out.append("Legend:  ● stored locally in this tool  ·  ✓ compatible (could be loaded if present)")
+    out.append("         Hub: ↥ Hub re-uploaded a model file (re-pull would replace bytes)  ·  ↻ Hub commit changed (likely metadata only)")
     out.append("Tools:   " + " · ".join(f"{tc}={name}" for tc, name in _TOOL_COLUMNS))
     return "\n".join(out)
 
@@ -2371,7 +2507,8 @@ def mark_for_curation(grid_rows):
     while True:
         print("\033[H\033[J", end="")
         print("Curation — mark for keep ✓ / delete ✕  (only ✕ deletes; defaults ●/○/· are no-ops)")
-        print("  ↑/↓ navigate · SPACE cycle · Y keep · N delete · DEL unmark · ENTER confirm · Ctrl+C cancel")
+        print("  ↑/↓ navigate · SPACE cycle · Y keep · N delete · DEL unmark · ENTER confirm · ESC or Ctrl+C cancel")
+        print("  Hub:  ↥ model file re-uploaded (re-pull would replace bytes)  ·  ↻ commit changed (likely metadata only)")
 
         # Live counts at the top so user sees pending impact.
         n_delete = sum(1 for s in states if s == "delete")
@@ -2405,7 +2542,7 @@ def mark_for_curation(grid_rows):
                     f"     {'Identity':<{_GRID_W_ID}} {'Runner':<{_GRID_W_RUN}} "
                     f"{'Quant':<{_GRID_W_QUANT}} {'Size':>{_GRID_W_SIZE}} "
                     f"{'Updated':<{_GRID_W_UPD}} {'CT':<{_GRID_W_CT}} {tool_header}  "
-                    f"{'Decision':<{_GRID_W_DEC}} From"
+                    f"{'Hub':^{_GRID_W_HUB}} {'Decision':<{_GRID_W_DEC}} From"
                 )
             else:
                 m = _marker(i) or " "
@@ -2453,7 +2590,7 @@ def mark_for_curation(grid_rows):
             states[idx] = None
         elif key == "\r":
             break
-        elif key == "\x03":
+        elif key in ("\x03", "\x1b"):  # Ctrl-C or bare ESC
             print("\nCancelled. No deletions.")
             return []
 
@@ -2669,7 +2806,7 @@ def discover(hub_meta=False, curate=False, interactive=False):
         })
 
     if hub_meta:
-        _enrich_with_hub_metadata(sections)
+        _enrich_with_hub_metadata(sections, hub_dir=hub_dir)
 
     print(format_discovery_report(sections, ad_hoc, len(mdfind_results), already_known, mdfind_note))
 
