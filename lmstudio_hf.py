@@ -449,7 +449,7 @@ def main():
             "\nRun `lmstudio_hf.py <command> --help` for full command options."
         ),
     )
-    sub = parser.add_subparsers(dest="cmd", title="commands", metavar="{import,mirror}")
+    sub = parser.add_subparsers(dest="cmd", title="commands", metavar="<command>")
     sub.add_parser(
         "import",
         help="Import MLX models from the HF cache into LM Studio (default if no command given).",
@@ -460,7 +460,7 @@ def main():
     )
     m = sub.add_parser(
         "mirror",
-        help="Mirror LM Studio models into the HF cache and replace with symlinks. Flags: --type {mlx,gguf,both}, --no-reuse.",
+        help="Mirror LM Studio models into the HF cache and replace with symlinks. Flags: --type mlx|gguf|both, --no-reuse.",
         description=(
             "Scan LM Studio's models directory (honoring ~/.lmstudio-home-pointer), "
             "ensure each model is in the Hugging Face cache (downloading from the Hub "
@@ -472,9 +472,10 @@ def main():
     )
     m.add_argument(
         "--type",
+        metavar="<type>",
         choices=["mlx", "gguf", "both"],
         default="mlx",
-        help="Model types to mirror (default: mlx, matching the import flow).",
+        help="One of: mlx, gguf, both. Default: mlx (matching the import flow).",
     )
     m.add_argument(
         "--no-reuse",
