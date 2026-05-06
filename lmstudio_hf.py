@@ -64,22 +64,23 @@ def select_models(model_choices):
 def get_key():
     """Get a single keypress from the user.
 
-    Handles single-byte keys plus the common ANSI escape sequences:
-      \\x1b           bare ESC (cancel)
+    Handles single-byte keys plus common ANSI escape sequences:
       \\x1b[A/B/C/D   arrow keys (3 bytes)
       \\x1b[3~        Delete / Forward Delete (4 bytes)
       \\x1b[5~/[6~    PageUp / PageDown (4 bytes)
       \\x1b[H / [F    Home / End (3 bytes)
 
-    Bare ESC vs ESC-prefixed sequence is disambiguated by a 50ms timeout:
-    if no follow-up byte arrives, the keypress is treated as bare ESC.
-    Without this, ESC alone would block forever waiting for a non-existent
-    second byte.
+    Note: bare ESC is NOT supported as a distinct key. Disambiguating bare
+    ESC from the start of an escape sequence requires a timeout, which
+    risks misclassifying a slow-arriving arrow-key sequence as bare ESC
+    on SSH or under load. Arrow keys must be 100% reliable, so we always
+    read at least 2 follow-up bytes after ESC. Use Q (or Ctrl-C) as the
+    cancel key in interactive pickers.
 
     After ESC + '[', if the third byte is a digit, keep reading until we
     hit a non-digit terminator (~, A-Z).
     """
-    import tty, termios, select
+    import tty, termios
 
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
@@ -87,16 +88,9 @@ def get_key():
         tty.setraw(sys.stdin.fileno())
         ch = sys.stdin.read(1)
         if ch == "\x1b":
-            # Peek for an immediate follow-up byte; if none, this is bare ESC.
-            ready, _, _ = select.select([sys.stdin], [], [], 0.05)
-            if not ready:
-                return "\x1b"
             ch += sys.stdin.read(2)
             if len(ch) == 3 and ch[-1].isdigit():
                 while True:
-                    ready, _, _ = select.select([sys.stdin], [], [], 0.05)
-                    if not ready:
-                        break
                     nxt = sys.stdin.read(1)
                     ch += nxt
                     if not nxt.isdigit():
@@ -2507,7 +2501,7 @@ def mark_for_curation(grid_rows):
     while True:
         print("\033[H\033[J", end="")
         print("Curation — mark for keep ✓ / delete ✕  (only ✕ deletes; defaults ●/○/· are no-ops)")
-        print("  ↑/↓ navigate · SPACE cycle · Y keep · N delete · DEL unmark · ENTER confirm · ESC or Ctrl+C cancel")
+        print("  ↑/↓ navigate · SPACE cycle · Y keep · N delete · DEL unmark · ENTER confirm · Q or Ctrl+C cancel")
         print("  Hub:  ↥ model file re-uploaded (re-pull would replace bytes)  ·  ↻ commit changed (likely metadata only)")
 
         # Live counts at the top so user sees pending impact.
@@ -2590,7 +2584,7 @@ def mark_for_curation(grid_rows):
             states[idx] = None
         elif key == "\r":
             break
-        elif key in ("\x03", "\x1b"):  # Ctrl-C or bare ESC
+        elif key == "\x03" or key.lower() == "q":
             print("\nCancelled. No deletions.")
             return []
 
@@ -2914,8 +2908,8 @@ def main():
         action="store_true",
         help="With --curate, show an interactive picker (cursor + ●/○/✓/✕ markers) "
              "instead of the static grid. SPACE cycles a row through keep/delete/unmark; "
-             "Y/N/DEL set state directly; ENTER confirms. Only ✕ marks delete; "
-             "default ●/○ suggestions are non-destructive.",
+             "Y/N/DEL set state directly; ENTER confirms; Q or Ctrl-C cancels. Only ✕ "
+             "marks delete; default ●/○ suggestions are non-destructive.",
     )
     args = parser.parse_args()
     if args.cmd == "mirror":
