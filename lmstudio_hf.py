@@ -523,13 +523,52 @@ def scan_hf_cache(hub_dir):
         })
     return out
 
-def scan_ollama_models(ollama_dir):
-    """Walk Ollama manifests and yield (family:tag, gguf_blob, size) records."""
+def _collect_hf_blob_hashes(hub_dir):
+    """Return the set of sha256 hex strings present as blobs in the HF cache."""
+    hashes = set()
+    if not hub_dir.exists():
+        return hashes
+    for entry in hub_dir.iterdir():
+        if not entry.is_dir() or not entry.name.startswith("models--"):
+            continue
+        blobs = entry / "blobs"
+        if not blobs.is_dir():
+            continue
+        for blob in blobs.iterdir():
+            if blob.is_file():
+                hashes.add(blob.name)
+    return hashes
+
+def scan_ollama_models(ollama_dir, app_name="Ollama", hf_blob_hashes=None):
+    """Walk Ollama-format manifests and yield records per tag.
+
+    Resolves each tag to its model blob by reading the manifest and looking up
+    the application/vnd.ollama.image.model layer. Captures the source registry
+    (registry.ollama.ai vs hf.co / huggingface.co) from the manifest path,
+    which determines whether the blob's bytes are eligible for HF-cache
+    deduplication:
+
+      registry.ollama.ai/library/...   Ollama-curated package, bytes unique
+                                       to Ollama's repacking; not byte-equal
+                                       to anything in HF cache. Tagged
+                                       `ollama_blob`.
+
+      hf.co/<user>/<repo> or
+      huggingface.co/<user>/<repo>     Direct HF GGUF download; blob is the
+                                       exact bytes of the upstream file.
+                                       Tagged `mirror_candidate` and, if
+                                       hf_blob_hashes is provided and the
+                                       blob's sha256 is already in HF cache,
+                                       tagged `dedup_confirmed`.
+
+    `hf_blob_hashes`, if supplied, is a set of sha256 hex strings already
+    present in the HF cache; any Ollama blob whose hash is in the set is a
+    confirmed duplicate regardless of which registry it came from.
+    """
     out = []
     manifests_root = ollama_dir / "manifests"
     if not manifests_root.exists():
         return out
-    # Layout: manifests/<registry>/<namespace>/<family>/<tag>
     for tag_path in manifests_root.rglob("*"):
         if not tag_path.is_file():
             continue
@@ -547,20 +586,41 @@ def scan_ollama_models(ollama_dir):
         digest = layer.get("digest", "")
         if not digest.startswith("sha256:"):
             continue
-        blob = ollama_dir / "blobs" / digest.replace(":", "-")
+        blob_hex = digest[len("sha256:"):]
+        blob = ollama_dir / "blobs" / f"sha256-{blob_hex}"
         try:
             size = blob.stat().st_size
         except OSError:
             continue
-        family = tag_path.parent.name
-        tag = tag_path.name
+
+        rel_parts = tag_path.relative_to(manifests_root).parts
+        registry = rel_parts[0] if rel_parts else "unknown"
+        tag = rel_parts[-1]
+        ns_parts = rel_parts[1:-1]
+        # Pretty model id, registry-aware:
+        #   registry.ollama.ai/library/gemma4/latest -> "gemma4:latest"
+        #   hf.co/bartowski/Llama-3.2/Q4_K_M         -> "bartowski/Llama-3.2:Q4_K_M"
+        if registry == "registry.ollama.ai" and ns_parts and ns_parts[0] == "library":
+            namespace = "/".join(ns_parts[1:])
+        else:
+            namespace = "/".join(ns_parts)
+        model_id = f"{namespace}:{tag}" if namespace else tag
+
+        if hf_blob_hashes is not None and blob_hex in hf_blob_hashes:
+            status = "dedup_confirmed"
+        elif registry in ("hf.co", "huggingface.co"):
+            status = "mirror_candidate"
+        else:
+            status = "ollama_blob"
+
         out.append({
-            "app": "Ollama",
-            "id": f"{family}:{tag}",
+            "app": app_name,
+            "id": model_id,
             "path": blob,
             "format": "gguf",
             "size": size,
-            "status": "ollama_blob",
+            "status": status,
+            "extra": {"registry": registry, "blob_sha256": blob_hex},
         })
     return out
 
@@ -833,6 +893,7 @@ def infer_source_from_path(path):
 _STATUS_TAGS = {
     "canonical":         "canonical",
     "mirror_candidate":  "mirror candidate",
+    "dedup_confirmed":   "dedup candidate (HF cache hit)",
     "gather_candidate":  "gather candidate",
     "proprietary":       "proprietary",
     "ollama_blob":       "ollama-format",
@@ -856,9 +917,12 @@ def _format_known_section(section):
     plural = "" if len(items) == 1 else "s"
     # Per-section count of items by status, for the section header.
     n_mirror = sum(1 for i in items if i.get("status") == "mirror_candidate")
+    n_dedup = sum(1 for i in items if i.get("status") == "dedup_confirmed")
     header = f"[{app}]   {paths}   {len(items)} {label}{plural} · {_human_size(total)}"
     if n_mirror:
         header += f" · {n_mirror} mirror candidate{'' if n_mirror == 1 else 's'}"
+    if n_dedup:
+        header += f" · {n_dedup} dedup confirmed"
     out = [header]
     if section.get("note"):
         out.append(f"  {section['note']}")
@@ -938,16 +1002,19 @@ def format_discovery_report(sections, ad_hoc, mdfind_total, already_known, mdfin
     # Candidates rollup — grouped by action so the user sees what's
     # actionable today and what could be next.
     mirror_items = []  # (app, id, size)
+    dedup_items = []   # (app, id, size)
     for s in sections:
         if s["status"] != "scanned":
             continue
         for i in s["items"]:
             if i.get("status") == "mirror_candidate":
                 mirror_items.append((s["app"], i["id"], i["size"]))
+            elif i.get("status") == "dedup_confirmed":
+                dedup_items.append((s["app"], i["id"], i["size"]))
 
     gather_items = [a for a in ad_hoc if a.get("status") == "gather_candidate"]
 
-    if mirror_items or gather_items:
+    if mirror_items or dedup_items or gather_items:
         lines.append("")
         lines.append("Candidates:")
     if mirror_items:
@@ -961,6 +1028,17 @@ def format_discovery_report(sections, ad_hoc, mdfind_total, already_known, mdfin
         for app in sorted(by_app):
             n, sz = by_app[app]
             lines.append(f"    {app}: {n} model{'' if n == 1 else 's'} · {_human_size(sz)}")
+    if dedup_items:
+        total = sum(sz for _, _, sz in dedup_items)
+        by_app = {}
+        for app, _, sz in dedup_items:
+            by_app.setdefault(app, [0, 0])
+            by_app[app][0] += 1
+            by_app[app][1] += sz
+        lines.append(f"  Dedup confirmed  ({len(dedup_items)} blob{'' if len(dedup_items) == 1 else 's'} · {_human_size(total)} byte-identical to HF cache):")
+        for app in sorted(by_app):
+            n, sz = by_app[app]
+            lines.append(f"    {app}: {n} blob{'' if n == 1 else 's'} · {_human_size(sz)}")
     if gather_items:
         total = sum(a["size"] for a in gather_items)
         by_kind = {}
@@ -980,6 +1058,10 @@ def discover():
     """Inventory HF-compatible models cached by other apps on this machine."""
     cache_dir = Path(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")))
     hub_dir = cache_dir / "hub"
+
+    # Pre-compute the set of blob sha256 hashes already in HF cache so each
+    # Ollama-format scanner can flag dedup-confirmed duplicates.
+    hf_blob_hashes = _collect_hf_blob_hashes(hub_dir)
 
     sections = []
     known_roots = []
@@ -1031,7 +1113,7 @@ def discover():
     add(
         "Ollama",
         [ollama_dir],
-        scan_ollama_models,
+        lambda p: scan_ollama_models(p, app_name="Ollama", hf_blob_hashes=hf_blob_hashes),
         app_install_paths=[
             "/Applications/Ollama.app",
             "/usr/local/bin/ollama",
@@ -1065,21 +1147,21 @@ def discover():
             Path(os.path.expanduser("~/Library/Application Support/Msty/models")),
             Path(os.path.expanduser("~/.msty/models")),
         ],
-        scan_ollama_models,
+        lambda p: scan_ollama_models(p, app_name="Msty", hf_blob_hashes=hf_blob_hashes),
         app_install_paths=["/Applications/Msty.app"],
     )
 
     add(
         "Msty Claw",
         [Path(os.path.expanduser("~/.mstyclaw/local-ai/models"))],
-        scan_ollama_models,
+        lambda p: scan_ollama_models(p, app_name="Msty Claw", hf_blob_hashes=hf_blob_hashes),
         app_install_paths=["/Applications/Msty Claw.app"],
     )
 
     add(
         "MstyStudio",
         [Path(os.path.expanduser("~/Library/Application Support/MstyStudio/models"))],
-        scan_ollama_models,
+        lambda p: scan_ollama_models(p, app_name="MstyStudio", hf_blob_hashes=hf_blob_hashes),
         app_install_paths=["/Applications/MstyStudio.app"],
     )
 
