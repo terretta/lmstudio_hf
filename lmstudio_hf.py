@@ -589,8 +589,15 @@ def _last_modified_days(enr):
     except Exception:
         return 0
 
-def _format_rank(fmt):
-    return {"mlx": 0, "gguf": 1, "safetensors": 2}.get(fmt, 3)
+def _runner_rank(runner):
+    """Lower is more preferred on Apple Silicon. mlx / mflux are native;
+    diffusers and transformers run but typically slower; gguf via llama.cpp
+    is fast for text. Unknown runners last."""
+    return {
+        "mlx": 0, "mflux": 0,
+        "gguf": 1,
+        "diffusers": 2, "transformers": 2,
+    }.get(runner, 3)
 
 def _quant_tier_rank(tier):
     return {"fp": 0, "8bit": 1, "6bit": 2, "5bit": 3, "4bit": 4, "3bit": 5, "other": 6, None: 7}[tier]
@@ -615,7 +622,7 @@ def _curation_sort_key(entry):
         -version,
         has_alignment,
         _quant_tier_rank(quant_tier),
-        _format_rank(enr.get("format")),
+        _runner_rank(enr.get("runner")),
         -_last_modified_days(enr),
         entry.get("id") or "",
     )
@@ -662,9 +669,12 @@ def curate_entries(entries):
         for m in sorted(members, key=_curation_sort_key):
             enr = m.get("enrichment") or {}
             v = _version_float(enr)
+            purpose = enr.get("purpose") or "instruct"
             alignment = enr.get("alignment") or "vanilla"
             tier = _quant_tier(enr.get("quantization")) or "other"
-            slot = f"{alignment}/{tier}"
+            # Slot keeps purpose-distinct keepers separately so a coder model
+            # and an instruct model in the same family don't redunds-each-other.
+            slot = f"{purpose}/{alignment}/{tier}"
             decision = None
             reason = None
 
@@ -871,13 +881,31 @@ _ALIGNMENT_TOKENS = (
     "heretic", "abliterated", "uncensored", "decensored", "disinhibited",
     "unrestricted", "neutered",
 )
-_VARIANT_TOKENS = (
-    ("vision", r"\b(vision|vl|visual)\b"),
-    ("coder",  r"\bcoder\b"),
-    ("thinking", r"\bthinking\b"),
-    ("instruct", r"\b(it|instruct|inst|chat)\b"),
-    ("base",   r"\bbase\b"),
+# Primary purpose of a model — what it's for. Single value per entry.
+# Vision-INPUT capability is separate (in `capabilities`) since most modern
+# instructs are vision-capable but you wouldn't keep two of them.
+_PURPOSE_TOKENS = (
+    ("reasoning", r"\b(reasoning|thinking|qwq)\b|[-_]r1[-_]"),  # explicit reasoning / R1 family
+    ("coder",     r"\b(coder|coding)\b"),
+    ("embedding", r"\b(embed|embedding|nomic-embed)\b"),
+    ("asr",       r"\b(parakeet|whisper|asr|stt)\b"),
+    ("base",      r"\bbase\b"),
+    # instruct/chat are the default — handled implicitly when nothing else matches
 )
+_INSTRUCT_TOKENS = re.compile(r"\b(it|instruct|inst|chat)\b")
+
+# Capabilities — additive. A model can have multiple. Inferred from HF tags
+# primarily; from name as fallback.
+_CAPABILITY_NAME_TOKENS = (
+    ("vision-input", re.compile(r"\b(vision|vl|visual|multimodal)\b")),
+    ("tool-calling", re.compile(r"\b(tool[-_]?(use|calling)|function[-_]?calling)\b")),
+    ("long-context", re.compile(r"\b(long[-_]?context|128k|256k|1m[-_]?context)\b")),
+)
+_CAPABILITY_TAG_KEYS = {
+    "vision-input": {"vision", "multimodal"},
+    "tool-calling": {"tool-use", "tool-calling", "function-calling"},
+    "long-context": {"long-context"},
+}
 _QUANT_PATTERNS = [
     ("q4_k_m",     r"q4[_-]?k[_-]?m"),
     ("q4_k_s",     r"q4[_-]?k[_-]?s"),
@@ -927,9 +955,11 @@ def parse_model_id(repo_id):
         "version":      None,
         "size":         None,
         "moe_active":   None,
-        "variant":      None,
+        "purpose":      None,   # primary purpose: instruct, coder, reasoning, embedding, asr, base, vision-output
         "alignment":    None,
-        "format":       None,
+        "format":       None,   # on-disk file format: safetensors, gguf, ckpt, bin
+        "runner":       None,   # intended runtime: mlx, mflux, transformers, diffusers, gguf, ollama, drawthings
+        "capabilities": [],     # additive: vision-input, tool-calling, long-context, ...
         "quantization": None,
         "training":     None,
     }
@@ -958,11 +988,28 @@ def parse_model_id(repo_id):
     if m:
         out["moe_active"] = f"A{m.group(1)}B"
 
-    if "mlx" in s:
-        out["format"] = "mlx"
+    # Runner / library — intended runtime. Looked up across the full
+    # publisher/name. mflux must be checked before mlx since "mflux" contains
+    # "flux" which could match other patterns.
+    if "mflux" in s:
+        out["runner"] = "mflux"
+    elif "mlx" in s:
+        out["runner"] = "mlx"
+    elif "diffusers" in s:
+        out["runner"] = "diffusers"
     elif "gguf" in s:
+        out["runner"] = "gguf"
+
+    # File format — what's on disk. Independent of runner. .gguf files are
+    # always GGUF; .safetensors and .ckpt are run by various runtimes.
+    if "gguf" in s:
         out["format"] = "gguf"
     elif "safetensors" in s:
+        out["format"] = "safetensors"
+    elif "ckpt" in s:
+        out["format"] = "ckpt"
+    # If MLX runner detected but no explicit format token, MLX implies safetensors
+    if out["runner"] == "mlx" and not out["format"]:
         out["format"] = "safetensors"
 
     for label, pat in _QUANT_PATTERNS:
@@ -970,10 +1017,21 @@ def parse_model_id(repo_id):
             out["quantization"] = label
             break
 
-    for label, pat in _VARIANT_TOKENS:
+    # Purpose: prefer the more specific category over generic instruct.
+    for label, pat in _PURPOSE_TOKENS:
         if re.search(pat, s):
-            out["variant"] = label
+            out["purpose"] = label
             break
+    if not out["purpose"]:
+        if _INSTRUCT_TOKENS.search(s):
+            out["purpose"] = "instruct"
+
+    # Capabilities — additive
+    caps = []
+    for label, pat in _CAPABILITY_NAME_TOKENS:
+        if pat.search(s):
+            caps.append(label)
+    out["capabilities"] = caps
 
     found_alignment = [kw for kw in _ALIGNMENT_TOKENS if kw in s]
     if found_alignment:
@@ -1361,21 +1419,31 @@ def _format_enrichment_line(enrichment):
             size_part = f"{size_part} {moe}".strip()
         parts.append(size_part)
     flavor_bits = []
-    if enrichment.get("variant"):
-        flavor_bits.append(enrichment["variant"])
+    if enrichment.get("purpose"):
+        flavor_bits.append(enrichment["purpose"])
     if enrichment.get("alignment"):
         flavor_bits.append(enrichment["alignment"])
     if enrichment.get("training"):
         flavor_bits.append(enrichment["training"])
     if flavor_bits:
         parts.append(" ".join(flavor_bits))
-    fmt_q = []
-    if enrichment.get("format"):
-        fmt_q.append(enrichment["format"])
-    if enrichment.get("quantization"):
-        fmt_q.append(enrichment["quantization"])
-    if fmt_q:
-        parts.append(" ".join(fmt_q))
+    caps = enrichment.get("capabilities") or []
+    if caps:
+        parts.append("+".join(caps))
+    runner = enrichment.get("runner")
+    fmt = enrichment.get("format")
+    quant = enrichment.get("quantization")
+    runner_fmt = []
+    if runner:
+        runner_fmt.append(runner)
+    if fmt and fmt != runner:
+        # show file format alongside runner when they differ (e.g.
+        # "mflux · safetensors", "diffusers · safetensors")
+        runner_fmt.append(fmt)
+    if quant:
+        runner_fmt.append(quant)
+    if runner_fmt:
+        parts.append(" ".join(runner_fmt))
     if enrichment.get("chat_template"):
         parts.append(f"ct:{enrichment['chat_template'][:8]}")
     if enrichment.get("last_modified"):
@@ -1543,6 +1611,38 @@ def _enrich_with_hub_metadata(sections):
         hits = sorted(set(t for t in tags if t in _ALIGNMENT_TOKENS))
         return "+".join(hits) if hits else None
 
+    def _detect_purpose_from_tags(tags, pipeline_tag):
+        """Map HF tags + pipeline_tag onto our purpose taxonomy."""
+        tag_set = {t.lower() for t in tags if isinstance(t, str)}
+        if any(t in tag_set for t in ("reasoning", "thinking", "chain-of-thought")):
+            return "reasoning"
+        if any(t in tag_set for t in ("code", "coder", "code-generation", "code-completion")):
+            return "coder"
+        if pipeline_tag in ("feature-extraction", "sentence-similarity", "sentence-embeddings"):
+            return "embedding"
+        if pipeline_tag in ("automatic-speech-recognition", "audio-to-audio"):
+            return "asr"
+        if pipeline_tag in ("text-to-image", "image-to-image"):
+            return "vision-output"
+        if pipeline_tag in ("text-to-video", "image-to-video"):
+            return "video-output"
+        # Default for conversational text models: instruct.
+        if "conversational" in tag_set or pipeline_tag in ("text-generation", "image-text-to-text"):
+            return "instruct"
+        return None
+
+    def _detect_capabilities_from_tags(tags, pipeline_tag):
+        tag_set = {t.lower() for t in tags if isinstance(t, str)}
+        caps = []
+        for cap, keys in _CAPABILITY_TAG_KEYS.items():
+            if tag_set & keys:
+                caps.append(cap)
+        # Vision-input is implicit when pipeline_tag accepts image input but
+        # outputs text (image-text-to-text).
+        if pipeline_tag == "image-text-to-text" and "vision-input" not in caps:
+            caps.append("vision-input")
+        return caps
+
     def _detect_architecture_from_tags(tags):
         # HF tags often include the model_type (e.g. "qwen3_5_moe", "gemma3",
         # "granite"). Pick the first tag that looks like an architecture
@@ -1586,6 +1686,8 @@ def _enrich_with_hub_metadata(sections):
         result["tags"] = tags
         result["alignment"] = _detect_alignment_from_tags(tags)
         result["model_type"] = _detect_architecture_from_tags(tags)
+        result["purpose"] = _detect_purpose_from_tags(tags, result["pipeline_tag"])
+        result["capabilities"] = _detect_capabilities_from_tags(tags, result["pipeline_tag"])
         cd = getattr(info, "card_data", None)
         if cd is not None:
             cd_dict = cd.to_dict() if hasattr(cd, "to_dict") else dict(cd)
@@ -1632,10 +1734,21 @@ def _enrich_with_hub_metadata(sections):
         enr["model_type"] = meta["model_type"]
         # Authoritative overrides — only when HF actually returned a value;
         # otherwise leave the heuristic-parsed field in place as fallback.
+        # library_name is the runner/runtime, NOT a file format. mflux,
+        # diffusers, transformers are runtimes that run safetensors files.
         if meta.get("library_name"):
-            enr["format"] = meta["library_name"]
+            enr["runner"] = meta["library_name"]
         if meta.get("alignment"):
             enr["alignment"] = meta["alignment"]
+        if meta.get("purpose"):
+            enr["purpose"] = meta["purpose"]
+        if meta.get("capabilities"):
+            # Merge capabilities from HF on top of name-parsed; dedupe.
+            existing = list(enr.get("capabilities") or [])
+            for c in meta["capabilities"]:
+                if c not in existing:
+                    existing.append(c)
+            enr["capabilities"] = existing
 
 _DECISION_TAG = {
     "keep":      "keep",
@@ -1711,9 +1824,16 @@ def format_curation_view(sections, ad_hoc):
             size_str = _human_size(e.get("size") or 0)
             enr = e.get("enrichment") or {}
             meta_bits = []
-            if enr.get("variant"): meta_bits.append(enr["variant"])
+            if enr.get("purpose"): meta_bits.append(enr["purpose"])
             if enr.get("alignment"): meta_bits.append(enr["alignment"])
-            if enr.get("format"): meta_bits.append(enr["format"])
+            if enr.get("capabilities"):
+                meta_bits.append("+".join(enr["capabilities"]))
+            runner = enr.get("runner")
+            fmt = enr.get("format")
+            if runner:
+                meta_bits.append(runner)
+            if fmt and fmt != runner:
+                meta_bits.append(fmt)
             if enr.get("quantization"): meta_bits.append(enr["quantization"])
             if enr.get("chat_template"): meta_bits.append(f"ct:{enr['chat_template'][:8]}")
             if enr.get("last_modified"): meta_bits.append(f"upd:{enr['last_modified']}")
