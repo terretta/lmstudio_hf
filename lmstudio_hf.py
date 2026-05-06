@@ -698,6 +698,22 @@ def infer_source_from_path(path):
         return {"kind": "user_curated", "label": f"Documents/{rel}",
                 "evidence": f"~/Documents/{rel}/"}
 
+    # Code repos / working dirs that store weights in a conventional subdir.
+    # Match the LAST occurrence so deeply nested paths report the closest parent.
+    storage_match = None
+    for kw in ("weights", "checkpoints", "model_weights", "models"):
+        idx = s.rfind(f"/{kw}/")
+        if idx == -1:
+            continue
+        if storage_match is None or idx > storage_match[0]:
+            storage_match = (idx, kw)
+    if storage_match is not None:
+        idx, kw = storage_match
+        parent = s[:idx]
+        parent_name = parent.split("/")[-1] or parent
+        return {"kind": "code_storage", "label": f"{parent_name}/{kw}",
+                "evidence": _friendly(Path(f"{parent}/{kw}"))}
+
     return {"kind": "unclassified", "label": None, "evidence": _friendly(path.parent)}
 
 def _format_known_section(section):
@@ -707,6 +723,8 @@ def _format_known_section(section):
     paths = ", ".join(_friendly(p) for p in section["paths"])
     if status == "not present":
         return [f"[{app}]   not present"]
+    if status == "installed; no model storage found":
+        return [f"[{app}]   installed; no model storage found at {paths}"]
     if status.startswith("scan failed"):
         return [f"[{app}]   {paths}   {status}"]
     items = section["items"]
@@ -744,6 +762,7 @@ def _format_ad_hoc_section(ad_hoc, mdfind_total, already_known, mdfind_note):
         ("user_download",   "Manual downloads (unsorted)"),
         ("cloud_sync",      "Cloud-synced (materialized locally)"),
         ("external_volume", "External volumes"),
+        ("code_storage",    "Code repos / working dirs with model weights"),
         ("unclassified",    "Truly unclassified"),
     ]
     for kind, heading in kind_order:
@@ -791,10 +810,12 @@ def discover():
     sections = []
     known_roots = []
 
-    def add(app, paths, scan_fn, note=None):
+    def add(app, paths, scan_fn, note=None, app_install_paths=None):
         present = [p for p in paths if p.exists()]
+        installed = any(Path(p).exists() for p in (app_install_paths or []))
         if not present:
-            sections.append({"app": app, "status": "not present", "paths": paths, "items": [], "note": note})
+            status = "installed; no model storage found" if installed else "not present"
+            sections.append({"app": app, "status": status, "paths": paths, "items": [], "note": note})
             return
         items = []
         try:
@@ -827,10 +848,20 @@ def discover():
             }
             for pub, name, model_dir, fmt in scan_lmstudio_models(p)
         ],
+        app_install_paths=["/Applications/LM Studio.app"],
     )
 
     ollama_dir = Path(os.environ.get("OLLAMA_MODELS", os.path.expanduser("~/.ollama/models")))
-    add("Ollama", [ollama_dir], scan_ollama_models)
+    add(
+        "Ollama",
+        [ollama_dir],
+        scan_ollama_models,
+        app_install_paths=[
+            "/Applications/Ollama.app",
+            "/usr/local/bin/ollama",
+            "/opt/homebrew/bin/ollama",
+        ],
+    )
 
     add(
         "GPT4All",
@@ -839,11 +870,22 @@ def discover():
             Path(os.path.expanduser("~/.local/share/nomic.ai/GPT4All")),
         ],
         lambda p: scan_flat_dir(p, "GPT4All"),
+        app_install_paths=["/Applications/GPT4All.app", "/Applications/gpt4all.app"],
     )
 
-    add("Jan", [Path(os.path.expanduser("~/jan/models"))], lambda p: scan_flat_dir(p, "Jan"))
+    add(
+        "Jan",
+        [Path(os.path.expanduser("~/jan/models"))],
+        lambda p: scan_flat_dir(p, "Jan"),
+        app_install_paths=["/Applications/Jan.app"],
+    )
 
-    add("Msty", [Path(os.path.expanduser("~/.msty/models"))], lambda p: scan_flat_dir(p, "Msty"))
+    add(
+        "Msty",
+        [Path(os.path.expanduser("~/.msty/models"))],
+        lambda p: scan_flat_dir(p, "Msty"),
+        app_install_paths=["/Applications/Msty.app"],
+    )
 
     add(
         "AnythingLLM",
@@ -852,6 +894,7 @@ def discover():
             Path(os.path.expanduser("~/.config/AnythingLLM/storage/models")),
         ],
         lambda p: scan_flat_dir(p, "AnythingLLM"),
+        app_install_paths=["/Applications/AnythingLLM.app"],
     )
 
     add(
@@ -868,6 +911,7 @@ def discover():
         [Path(os.path.expanduser(
             "~/Library/Containers/com.liuliu.draw-things/Data/Documents/Models"))],
         lambda p: scan_flat_dir(p, "Draw Things"),
+        app_install_paths=["/Applications/Draw Things.app"],
     )
 
     db_root = Path(os.path.expanduser("~/.diffusionbee"))
@@ -879,6 +923,10 @@ def discover():
             + scan_flat_dir(p / "custom_models", "Diffusion Bee")
             + scan_flat_dir(p / "downloads", "Diffusion Bee")
         ),
+        app_install_paths=[
+            "/Applications/DiffusionBee.app",
+            "/Applications/Diffusion Bee.app",
+        ],
     )
 
     mdfind_results, mdfind_note = scan_mdfind()
