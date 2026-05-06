@@ -519,6 +519,7 @@ def scan_hf_cache(hub_dir):
             "path": snapshot,
             "format": fmt,
             "size": _dir_size(entry),
+            "status": "canonical",
         })
     return out
 
@@ -559,6 +560,7 @@ def scan_ollama_models(ollama_dir):
             "path": blob,
             "format": "gguf",
             "size": size,
+            "status": "ollama_blob",
         })
     return out
 
@@ -630,6 +632,7 @@ def scan_drawthings_models(model_dir):
             "path": path,
             "format": "ckpt",
             "size": total,
+            "status": "proprietary",
         })
     return out
 
@@ -655,6 +658,7 @@ def scan_flat_dir(root, app_name, extensions=_MODEL_EXTENSIONS):
             "path": path,
             "format": path.suffix.lower().lstrip("."),
             "size": size,
+            "status": "mirror_candidate",
         })
     return out
 
@@ -788,6 +792,15 @@ def infer_source_from_path(path):
 
     return {"kind": "unclassified", "label": None, "evidence": _friendly(path.parent)}
 
+_STATUS_TAGS = {
+    "canonical":         "canonical",
+    "mirror_candidate":  "mirror candidate",
+    "gather_candidate":  "gather candidate",
+    "proprietary":       "proprietary",
+    "ollama_blob":       "ollama-format",
+    "owned_by_app":      "owned by app",
+}
+
 def _format_known_section(section):
     """Render one known-cache section."""
     app = section["app"]
@@ -803,14 +816,23 @@ def _format_known_section(section):
     total = sum(i["size"] for i in items)
     label = "repo" if app == "Hugging Face cache" else "model"
     plural = "" if len(items) == 1 else "s"
-    out = [f"[{app}]   {paths}   {len(items)} {label}{plural} · {_human_size(total)}"]
+    # Per-section count of items by status, for the section header.
+    n_mirror = sum(1 for i in items if i.get("status") == "mirror_candidate")
+    header = f"[{app}]   {paths}   {len(items)} {label}{plural} · {_human_size(total)}"
+    if n_mirror:
+        header += f" · {n_mirror} mirror candidate{'' if n_mirror == 1 else 's'}"
+    out = [header]
     if section.get("note"):
         out.append(f"  {section['note']}")
     for i in items:
-        extra = ""
+        meta_parts = [i["format"], _human_size(i["size"])]
         if i.get("extra", {}).get("symlinked"):
-            extra = ", symlinked → HF cache"
-        out.append(f"  - {i['id']} ({i['format']}, {_human_size(i['size'])}{extra})")
+            meta_parts.append("symlinked → HF cache")
+        line = f"  - {i['id']} ({', '.join(meta_parts)})"
+        tag = _STATUS_TAGS.get(i.get("status"))
+        if tag and tag != "canonical":  # canonical is implicit; don't clutter
+            line += f"   [{tag}]"
+        out.append(line)
     return out
 
 def _format_ad_hoc_section(ad_hoc, mdfind_total, already_known, mdfind_note):
@@ -824,25 +846,27 @@ def _format_ad_hoc_section(ad_hoc, mdfind_total, already_known, mdfind_note):
     by_kind = {}
     for f in ad_hoc:
         by_kind.setdefault(f["inferred"]["kind"], []).append(f)
+    # (kind, heading, action) — action is the suggested handling for this bucket.
     kind_order = [
-        ("sandbox",         "Sandboxed apps (containers)"),
-        ("app_support",     "App Support directories"),
-        ("app_cache",       "App Caches"),
-        ("hf_format",       "HF-cache-format at non-canonical locations"),
-        ("tool_named",      "Tool-named directories"),
-        ("user_curated",    "User-curated personal storage"),
-        ("user_download",   "Manual downloads (unsorted)"),
-        ("cloud_sync",      "Cloud-synced (materialized locally)"),
-        ("external_volume", "External volumes"),
-        ("code_storage",    "Code repos / working dirs with model weights"),
-        ("unclassified",    "Truly unclassified"),
+        ("sandbox",         "Sandboxed apps (containers)",                  "owned_by_app"),
+        ("app_support",     "App Support directories",                      "owned_by_app"),
+        ("app_cache",       "App Caches",                                   "owned_by_app"),
+        ("hf_format",       "HF-cache-format at non-canonical locations",   "gather_candidate"),
+        ("tool_named",      "Tool-named directories",                       "gather_candidate"),
+        ("user_curated",    "User-curated personal storage",                "gather_candidate"),
+        ("user_download",   "Manual downloads (unsorted)",                  "gather_candidate"),
+        ("cloud_sync",      "Cloud-synced (materialized locally)",          "gather_candidate"),
+        ("external_volume", "External volumes",                             "gather_candidate"),
+        ("code_storage",    "Code repos / working dirs with model weights", "gather_candidate"),
+        ("unclassified",    "Truly unclassified",                           "gather_candidate"),
     ]
-    for kind, heading in kind_order:
+    for kind, heading, action in kind_order:
         files = by_kind.get(kind)
         if not files:
             continue
         out.append("")
-        out.append(f"  {heading}:")
+        action_tag = _STATUS_TAGS.get(action, "")
+        out.append(f"  {heading}:" + (f"   [{action_tag}]" if action_tag else ""))
         by_label = {}
         for f in files:
             label = f["inferred"]["label"] or "(unknown)"
@@ -872,6 +896,46 @@ def format_discovery_report(sections, ad_hoc, mdfind_total, already_known, mdfin
     lines.append(f"  {total_known_items} model entr{'y' if total_known_items == 1 else 'ies'} across {scanned} active known cache{'s' if scanned != 1 else ''}")
     lines.append(f"  Tier 2 mdfind: {mdfind_total} candidate{'s' if mdfind_total != 1 else ''} scanned, {already_known} already in known caches")
     lines.append(f"  Tier 2 unique ad-hoc finds: {len(ad_hoc)}")
+
+    # Candidates rollup — grouped by action so the user sees what's
+    # actionable today and what could be next.
+    mirror_items = []  # (app, id, size)
+    for s in sections:
+        if s["status"] != "scanned":
+            continue
+        for i in s["items"]:
+            if i.get("status") == "mirror_candidate":
+                mirror_items.append((s["app"], i["id"], i["size"]))
+
+    gather_items = [a for a in ad_hoc if a.get("status") == "gather_candidate"]
+
+    if mirror_items or gather_items:
+        lines.append("")
+        lines.append("Candidates:")
+    if mirror_items:
+        total = sum(sz for _, _, sz in mirror_items)
+        by_app = {}
+        for app, _, sz in mirror_items:
+            by_app.setdefault(app, [0, 0])
+            by_app[app][0] += 1
+            by_app[app][1] += sz
+        lines.append(f"  Mirror candidates  ({len(mirror_items)} model{'' if len(mirror_items) == 1 else 's'} · {_human_size(total)}):")
+        for app in sorted(by_app):
+            n, sz = by_app[app]
+            lines.append(f"    {app}: {n} model{'' if n == 1 else 's'} · {_human_size(sz)}")
+    if gather_items:
+        total = sum(a["size"] for a in gather_items)
+        by_kind = {}
+        for a in gather_items:
+            kind = a["inferred"]["kind"]
+            label = a["inferred"]["label"] or "(unknown)"
+            key = (kind, label)
+            by_kind.setdefault(key, [0, 0])
+            by_kind[key][0] += 1
+            by_kind[key][1] += a["size"]
+        lines.append(f"  Gather candidates  ({len(gather_items)} file{'' if len(gather_items) == 1 else 's'} · {_human_size(total)}):")
+        for (kind, label), (n, sz) in sorted(by_kind.items()):
+            lines.append(f"    {kind} / {label}: {n} file{'' if n == 1 else 's'} · {_human_size(sz)}")
     return "\n".join(lines)
 
 def discover():
@@ -906,20 +970,22 @@ def discover():
         note="shared by: mlx-lm, mlx_vlm, mflux, vLLM, transformers, huggingface_hub",
     )
 
+    def _lms_record(pub, name, model_dir, fmt):
+        symlinked = is_already_symlinked(model_dir)
+        return {
+            "app": "LM Studio",
+            "id": f"{pub}/{name}",
+            "path": model_dir,
+            "format": fmt,
+            "size": _dir_size(model_dir),
+            "extra": {"symlinked": symlinked},
+            "status": "canonical" if symlinked else "mirror_candidate",
+        }
+
     add(
         "LM Studio",
         [resolve_lm_studio_models_dir()],
-        lambda p: [
-            {
-                "app": "LM Studio",
-                "id": f"{pub}/{name}",
-                "path": model_dir,
-                "format": fmt,
-                "size": _dir_size(model_dir),
-                "extra": {"symlinked": is_already_symlinked(model_dir)},
-            }
-            for pub, name, model_dir, fmt in scan_lmstudio_models(p)
-        ],
+        lambda p: [_lms_record(*t) for t in scan_lmstudio_models(p)],
         app_install_paths=["/Applications/LM Studio.app"],
     )
 
@@ -1032,6 +1098,14 @@ def discover():
 
     mdfind_results, mdfind_note = scan_mdfind()
 
+    # The status assigned per inferred kind, mirroring kind_order in the
+    # report formatter. Sandboxed / app-support / app-cache hits are owned
+    # by another app and shouldn't be moved; the rest are gather candidates.
+    _AD_HOC_ACTION = {
+        "sandbox":         "owned_by_app",
+        "app_support":     "owned_by_app",
+        "app_cache":       "owned_by_app",
+    }
     ad_hoc = []
     already_known = 0
     for path, size in mdfind_results:
@@ -1046,11 +1120,13 @@ def discover():
         if is_known:
             already_known += 1
             continue
+        inferred = infer_source_from_path(path)
         ad_hoc.append({
             "path": path,
             "size": size,
             "format": path.suffix.lower().lstrip("."),
-            "inferred": infer_source_from_path(path),
+            "inferred": inferred,
+            "status": _AD_HOC_ACTION.get(inferred["kind"], "gather_candidate"),
         })
 
     print(format_discovery_report(sections, ad_hoc, len(mdfind_results), already_known, mdfind_note))
