@@ -434,10 +434,42 @@ def mirror_to_huggingface(types, reuse_local=True):
 
 def main():
     """Entry point: dispatch the import (default) or mirror subcommand."""
-    parser = argparse.ArgumentParser(prog="lmstudio-hf")
-    sub = parser.add_subparsers(dest="cmd")
-    sub.add_parser("import", help="Import MLX models from HF cache into LM Studio (default).")
-    m = sub.add_parser("mirror", help="Mirror LM Studio models into HF cache and replace with symlinks.")
+    parser = argparse.ArgumentParser(
+        prog="lmstudio-hf",
+        description="Manage MLX/GGUF models between the Hugging Face cache and LM Studio.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  uv run lmstudio_hf.py                       # default: import flow\n"
+            "  uv run lmstudio_hf.py import                # explicit: import flow\n"
+            "  uv run lmstudio_hf.py mirror                # mirror MLX models, smart-reuse on\n"
+            "  uv run lmstudio_hf.py mirror --type gguf    # mirror GGUF models only\n"
+            "  uv run lmstudio_hf.py mirror --type both    # mirror MLX and GGUF\n"
+            "  uv run lmstudio_hf.py mirror --no-reuse     # force full re-download\n"
+            "\nRun `lmstudio_hf.py <command> --help` for full command options."
+        ),
+    )
+    sub = parser.add_subparsers(dest="cmd", title="commands", metavar="{import,mirror}")
+    sub.add_parser(
+        "import",
+        help="Import MLX models from the HF cache into LM Studio (default if no command given).",
+        description=(
+            "Scan the Hugging Face cache for MLX models and create per-file symlinks "
+            "in ~/.cache/lm-studio/models/ so LM Studio can use them."
+        ),
+    )
+    m = sub.add_parser(
+        "mirror",
+        help="Mirror LM Studio models into the HF cache and replace with symlinks. Flags: --type {mlx,gguf,both}, --no-reuse.",
+        description=(
+            "Scan LM Studio's models directory (honoring ~/.lmstudio-home-pointer), "
+            "ensure each model is in the Hugging Face cache (downloading from the Hub "
+            "when missing, but reusing matching local files via sha256-verified blob "
+            "ingestion when possible), then replace each LM Studio model directory with "
+            "per-file symlinks pointing into the HF snapshot."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     m.add_argument(
         "--type",
         choices=["mlx", "gguf", "both"],
