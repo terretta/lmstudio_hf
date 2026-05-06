@@ -741,9 +741,13 @@ def curate_entries(entries):
         v_max = max(versions) if versions else None
 
         # Build the set of "feature signatures" present at V_max — what
-        # purposes, alignment statuses, and capabilities the latest family
-        # version actually covers. Each signature is (purpose, aligned_bool,
-        # frozenset(capabilities)).
+        # purposes, alignment statuses, capabilities, AND maximum size class
+        # the latest family version actually covers. Each signature is
+        # (purpose, aligned_bool, frozenset(capabilities), size_class_num).
+        # Size class matters: a newer 35B can't substitute for an older 122B
+        # (knowledge capacity, instruction-following at hard tasks, recall on
+        # long-tail facts all degrade as parameters drop). Size class numeric:
+        # tiny=0, small=1, medium=2, large=3, xl=4, xxl=5; larger = bigger.
         vmax_feats = []
         if v_max is not None:
             for m in members:
@@ -754,38 +758,42 @@ def curate_entries(entries):
                         enr.get("purpose") or "instruct",
                         bool(enr.get("alignment")),
                         frozenset(enr.get("capabilities") or []),
+                        _size_class_numeric(enr.get("size") or ""),
                     ))
 
         # Pass 1 — feature-coverage supersession.
         # An older-version entry is superseded by V_max iff some V_max entry
         # has the same purpose, the same alignment status (vanilla vs aligned),
-        # and a capability set that's a superset of the older entry's. If V_max
-        # is missing any of those — different purpose, switching from aligned
-        # to vanilla, or losing a capability the older one had (e.g. older has
-        # vision-input but V_max only has text-only variants) — the older
-        # entry stays a keeper because the newer family lacks something key.
+        # a capability set ⊇ the older's, AND a size class >= the older's.
+        # If V_max is missing any of those — different purpose, switching
+        # alignment, losing a capability, OR not having a model at the older's
+        # size class or larger — the older entry stays a keeper because the
+        # newer family lacks something key (capability or scale).
         for m in members:
             enr = m.get("enrichment") or {}
             v = _version_float(enr)
             if v_max is None or v is None or v >= v_max:
                 continue
-            older_feat = (
-                enr.get("purpose") or "instruct",
-                bool(enr.get("alignment")),
-                frozenset(enr.get("capabilities") or []),
-            )
-            covered_by = None
-            for vm_p, vm_a, vm_c in vmax_feats:
-                if vm_p == older_feat[0] and vm_a == older_feat[1] and older_feat[2].issubset(vm_c):
-                    covered_by = (vm_p, vm_a, vm_c)
+            older_purpose = enr.get("purpose") or "instruct"
+            older_aligned = bool(enr.get("alignment"))
+            older_caps = frozenset(enr.get("capabilities") or [])
+            older_sc = _size_class_numeric(enr.get("size") or "")
+            covered = False
+            for vm_p, vm_a, vm_c, vm_sc in vmax_feats:
+                # Unknown sizes (sc==99) don't constrain coverage in either
+                # direction — we just don't have the signal to compare.
+                size_ok = (older_sc == 99) or (vm_sc == 99) or (vm_sc >= older_sc)
+                if (vm_p == older_purpose and vm_a == older_aligned
+                        and older_caps.issubset(vm_c) and size_ok):
+                    covered = True
                     break
-            if covered_by is not None:
+            if covered:
                 m["curation"]["decision"] = "supersede"
-                aligned_label = "aligned" if older_feat[1] else "vanilla"
-                caps_label = ("+".join(sorted(older_feat[2])) if older_feat[2] else "no extra caps")
+                aligned_label = "aligned" if older_aligned else "vanilla"
+                caps_label = "+".join(sorted(older_caps)) if older_caps else "no extra caps"
                 m["curation"]["reason"] = (
-                    f"v{v:g} role ({older_feat[0]}, {aligned_label}, {caps_label}) "
-                    f"covered by v{v_max:g}"
+                    f"v{v:g} role ({older_purpose}, {aligned_label}, {caps_label}, "
+                    f"size_class<={_size_class_label(enr.get('size') or '')}) covered by v{v_max:g}"
                 )
 
         # Pass 2 — slot-based keep/redundant among the un-superseded.
