@@ -169,6 +169,3 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
-
-# uv lockfile generated when running scripts via `uv run` (PEP 723 header)
-uv.lock
