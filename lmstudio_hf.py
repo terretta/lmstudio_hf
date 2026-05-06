@@ -17,7 +17,7 @@ def select_models(model_choices):
         window_end = min(window_start + window_size, len(model_choices))
 
         for i in range(window_start, window_end):
-            display_name, _, _, _ = model_choices[i]
+            display_name = model_choices[i][0]
             print(f"{'>' if i == idx else ' '} {'◉' if selected[i] else '○'} {display_name}")
 
         key = get_key()
