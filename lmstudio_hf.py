@@ -2172,7 +2172,10 @@ def format_curation_grid(sections, ad_hoc):
     # Column widths — chosen so the grid fits in ~150 cols. Values that
     # would overflow are explicitly truncated below; subsequent columns
     # therefore stay aligned regardless of input length.
-    W_ID, W_RUN, W_QUANT, W_SIZE, W_UPD, W_CT, W_DEC, W_FROM = 46, 12, 11, 7, 11, 8, 10, 32
+    # Width of the Size column. _human_size produces strings like "116.2 GB"
+    # or "522.6 MB" that are 8 chars when the integer part is three digits;
+    # 7 isn't enough and overflows shift every subsequent column right.
+    W_ID, W_RUN, W_QUANT, W_SIZE, W_UPD, W_CT, W_DEC, W_FROM = 46, 12, 11, 8, 11, 8, 10, 32
 
     for purpose in purposes:
         members = by_purpose.get(purpose) or []
