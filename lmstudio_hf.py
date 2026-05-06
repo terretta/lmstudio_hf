@@ -1977,6 +1977,10 @@ def _enrich_with_hub_metadata(sections, hub_dir=None):
     if not targets:
         return
 
+    # Per-run cache for the in-memory chat-template fetches. Avoids hitting
+    # the same repo twice when several entries point at the same model.
+    ct_cache = {}
+
     print(f"  (fetching Hub metadata for {len(targets)} repo{'' if len(targets) == 1 else 's'}...)", file=sys.stderr, flush=True)
     for item, repo_id in targets:
         meta = lookup(repo_id)
@@ -2020,6 +2024,24 @@ def _enrich_with_hub_metadata(sections, hub_dir=None):
         if hub_dir is not None and "/" in repo_id:
             pub, name = repo_id.split("/", 1)
             enr["local_lfs_shas"] = _local_lfs_shas(hub_dir, pub, name)
+
+        # If the Hub has a different commit sha than our local snapshot AND
+        # the LFS file set is intact, the change is in non-LFS files —
+        # README, tokenizer config, generation config, etc. Pull
+        # tokenizer_config.json into memory to see if the chat template
+        # specifically was the thing that changed (that's the
+        # prompt-format-affecting case). Only fetched once per repo per
+        # run, only when ↻ would otherwise be the icon — never touches
+        # disk.
+        local_sha = (item.get("enrichment") or {}).get("local_sha")
+        hub_sha = meta.get("hub_sha")
+        hub_lfs = meta.get("hub_lfs_shas") or frozenset()
+        local_lfs = enr.get("local_lfs_shas") or frozenset()
+        if (hub_sha and local_sha and hub_sha != local_sha
+                and hub_lfs and hub_lfs.issubset(local_lfs)):
+            if repo_id not in ct_cache:
+                ct_cache[repo_id] = _fetch_hub_chat_template_fp(repo_id, hub_sha)
+            enr["hub_chat_template"] = ct_cache[repo_id]
 
 _DECISION_TAG = {
     "keep":      "keep",
@@ -2231,18 +2253,77 @@ _GRID_W_ID, _GRID_W_RUN, _GRID_W_QUANT, _GRID_W_SIZE, _GRID_W_UPD, _GRID_W_CT, _
     46, 12, 11, 8, 11, 8, 3, 10, 32
 )
 
+def _fetch_hub_chat_template_fp(repo_id, revision):
+    """Fetch the Hub's chat_template into memory and return its fingerprint.
+
+    Looks at tokenizer_config.json's `chat_template` field first, falling
+    back to a standalone chat_template.jinja file. Returns the same shape
+    of fingerprint as chat_template_fingerprint() (sha256 hex prefix).
+
+    The fetch is in-memory only — never touches disk. Uses
+    huggingface_hub.hf_hub_url + huggingface_hub.utils.build_hf_headers
+    to pick up HF_TOKEN auth for gated/private repos automatically, then
+    plain urllib.request to actually pull the bytes. No on-disk cache,
+    no .cache/huggingface side effects from this function.
+
+    Returns None on any failure (missing file, 404, parse error, gated
+    without auth, network glitch).
+    """
+    try:
+        from huggingface_hub import hf_hub_url
+        from huggingface_hub.utils import build_hf_headers
+    except Exception:
+        return None
+    import urllib.request
+    import urllib.error
+
+    candidates = [("tokenizer_config.json", "json"),
+                  ("chat_template.jinja", "raw")]
+    for filename, kind in candidates:
+        try:
+            url = hf_hub_url(repo_id, filename, revision=revision or "main")
+        except Exception:
+            continue
+        try:
+            headers = build_hf_headers()
+        except Exception:
+            headers = {}
+        try:
+            req = urllib.request.Request(url, headers=dict(headers))
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = resp.read().decode("utf-8")
+        except urllib.error.HTTPError:
+            continue
+        except Exception:
+            continue
+        template = None
+        if kind == "json":
+            try:
+                obj = json.loads(data)
+                template = obj.get("chat_template")
+            except Exception:
+                continue
+        else:
+            template = data
+        if template:
+            return hashlib.sha256(template.encode("utf-8")).hexdigest()[:8]
+    return None
+
 def _hub_status_icon(enr):
     """Return a short icon describing this entry's local-vs-Hub state, or ' '.
 
-    ↥ (upgrade)  Hub has at least one LFS file with a sha256 our local cache
-                 doesn't have — i.e. the model file itself was re-uploaded.
-                 Strong signal: a re-pull would replace bytes.
-    ↻ (refresh)  Hub's commit sha differs from the local snapshot's, but the
-                 LFS file set is unchanged. Likely a metadata/README/tokenizer
-                 update; bytes-on-disk would be unaffected by a re-pull.
-    ' ' (blank)  In sync OR not enough Hub data fetched to compare (no
-                 --hub-meta, gated/private repo, network failure, or this
-                 entry isn't HF-cache-shaped).
+    ↥ (upgrade)         Hub has at least one LFS file with a sha256 our
+                        local cache doesn't have — the model file itself
+                        was re-uploaded. Re-pull would replace bytes.
+    ♢ (white diamond)   Commit changed AND the chat template specifically
+                        is different from local. Visually evokes <html>-style
+                        template brackets; signals a prompt-format update
+                        that may need re-evaluation in clients.
+    ↻ (refresh)         Commit changed, LFS files intact, chat template
+                        unchanged or not checkable — likely a README,
+                        generation_config, or other metadata update.
+    ' ' (blank)         In sync OR not enough Hub data fetched to compare
+                        (no --hub-meta, gated/private without auth, etc.).
     """
     hub_lfs = enr.get("hub_lfs_shas")
     local_lfs = enr.get("local_lfs_shas")
@@ -2251,6 +2332,10 @@ def _hub_status_icon(enr):
     hub_sha = enr.get("hub_sha")
     local_sha = enr.get("local_sha")
     if hub_sha and local_sha and hub_sha != local_sha:
+        local_ct = enr.get("chat_template")
+        hub_ct = enr.get("hub_chat_template")
+        if local_ct and hub_ct and local_ct != hub_ct:
+            return "♢"
         return "↻"
     return " "
 
@@ -2430,7 +2515,7 @@ def format_curation_grid(sections, ad_hoc):
             out.append("  " + _format_grid_row_content(r, tool_codes))
     out.append("")
     out.append("Legend:  ● stored locally in this tool  ·  ✓ compatible (could be loaded if present)")
-    out.append("         Hub: ↥ Hub re-uploaded a model file (re-pull would replace bytes)  ·  ↻ Hub commit changed (likely metadata only)")
+    out.append("         Hub: ↥ Hub re-uploaded a model file (re-pull would replace bytes)  ·  ♢ chat template specifically changed  ·  ↻ Hub commit changed (likely metadata only)")
     out.append("Tools:   " + " · ".join(f"{tc}={name}" for tc, name in _TOOL_COLUMNS))
     return "\n".join(out)
 
@@ -2502,7 +2587,7 @@ def mark_for_curation(grid_rows):
         print("\033[H\033[J", end="")
         print("Curation — mark for keep ✓ / delete ✕  (only ✕ deletes; defaults ●/○/· are no-ops)")
         print("  ↑/↓ navigate · SPACE cycle · Y keep · N delete · DEL unmark · ENTER confirm · Q or Ctrl+C cancel")
-        print("  Hub:  ↥ model file re-uploaded (re-pull would replace bytes)  ·  ↻ commit changed (likely metadata only)")
+        print("  Hub:  ↥ model file re-uploaded (re-pull would replace bytes)  ·  ♢ chat template specifically changed  ·  ↻ commit changed (likely metadata only)")
 
         # Live counts at the top so user sees pending impact.
         n_delete = sum(1 for s in states if s == "delete")
