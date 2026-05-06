@@ -525,6 +525,56 @@ def _quant_tier(quant):
         return None
     return _QUANT_TIER.get(quant, "other")
 
+def _size_numeric(size_str):
+    """Approximate parameter count in billions, or None if unparseable.
+
+    Handles the standard '<n>B' form ('7B', '12B', '122B') and Gemma's edge
+    variants ('E4B' → 4). Used both for sort ordering and bucket assignment.
+    """
+    if not size_str:
+        return None
+    s = size_str.upper().rstrip("B")
+    if s.startswith("E"):
+        s = s[1:]
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+# Size buckets aligned with how people actually talk about model scale —
+# "the 8B class", "the 30B class". Boundaries chosen so each bucket
+# captures a typical model line cluster. Used for slot-grouping (keeper
+# determination) and for in-family sort within the curation grid.
+_SIZE_CLASS_BUCKETS = [
+    ("tiny",   0,    4),     # < 4B (sub-clip / encoder-scale)
+    ("small",  4,    10),    # 4-10B (Llama-7B, Gemma-7B/8B, Mistral-7B)
+    ("medium", 10,   20),    # 10-20B (Gemma-12B, Llama-13B)
+    ("large",  20,   50),    # 20-50B (Gemma-26B/31B, Qwen-27B/35B)
+    ("xl",     50,   100),   # 50-100B (Llama-70B class)
+    ("xxl",    100,  9999),  # 100B+ (Qwen-122B, MiniMax)
+]
+
+def _size_class_label(size_str):
+    n = _size_numeric(size_str)
+    if n is None:
+        return "?"
+    for label, lo, hi in _SIZE_CLASS_BUCKETS:
+        if lo <= n < hi:
+            return label
+    return "?"
+
+_SIZE_CLASS_NUMERIC = {label: i for i, (label, _, _) in enumerate(_SIZE_CLASS_BUCKETS)}
+_SIZE_CLASS_NUMERIC["?"] = 99
+
+def _size_class_numeric(size_str):
+    return _SIZE_CLASS_NUMERIC.get(_size_class_label(size_str), 99)
+
+def _arch_label(enr):
+    """'dense' or 'MoE A4B' (with active-params suffix when present)."""
+    if enr.get("moe_active"):
+        return f"MoE {enr['moe_active']}"
+    return "dense"
+
 def _modality_class(pipeline_tag):
     """Coarsen a pipeline_tag into one of {text, image, video, audio}.
 
@@ -553,20 +603,34 @@ def _modality_class(pipeline_tag):
     return "text"
 
 def _family_group_key(entry):
-    """Hashable group key for curation: (family, size, moe_active, modality).
+    """Hashable group key for curation: (family, modality).
 
-    Same family + same parameter scale + same modality lands together
-    regardless of publisher, format, or quantization. Different sizes
-    (4B vs 26B) and MoE activation patterns (A4B vs A10B) stay distinct.
-    Modality (text vs image vs video) splits e.g. Qwen-Image-Edit from
-    Qwen3-Coder when both parse as family='qwen' with no size.
+    Broad: every variant of the same family + modality lands in one group
+    so cross-version comparisons within an architectural niche can fire.
+    The fine-grained niche (size class, dense vs MoE, alignment, quant tier)
+    is encoded in the slot key — supersession only triggers when both group
+    AND slot match.
     """
     enr = (entry.get("enrichment") or {})
     family = enr.get("family")
     if not family:
-        return None  # un-curatable; no family parsed
+        return None
     modality = _modality_class(enr.get("pipeline_tag"))
-    return (family, enr.get("size") or "", enr.get("moe_active") or "", modality)
+    return (family, modality)
+
+def _slot_key(entry):
+    """Slot identity within a family group. Two entries with the same slot
+    key compete: newer version wins, others are superseded. Different slots
+    don't compete — gemma 4 26B-A4B (large MoE) and gemma 4 31B (large dense)
+    are distinct slots so both can be keepers.
+    """
+    enr = entry.get("enrichment") or {}
+    purpose = enr.get("purpose") or "instruct"
+    size_class = _size_class_label(enr.get("size") or "")
+    arch = "moe" if enr.get("moe_active") else "dense"
+    alignment = enr.get("alignment") or "vanilla"
+    tier = _quant_tier(enr.get("quantization")) or "other"
+    return f"{purpose}/{size_class}/{arch}/{alignment}/{tier}"
 
 def _version_float(enr):
     if not enr:
@@ -656,64 +720,49 @@ def curate_entries(entries):
         by_group.setdefault(key, []).append(e)
 
     for key, members in by_group.items():
-        family, size, moe, modality = key
-        # Suffix non-text modality so the group label distinguishes
-        # text-LLM vs image/video pipelines that share family/size.
+        family, modality = key
         modality_suffix = "" if modality == "text" else f" [{modality}]"
-        label = " ".join(p for p in (family, size, moe) if p) or family
-        label = f"{label}{modality_suffix}"
-        # Highest version present in this group (or 0 if none have versions).
-        versions = [v for v in (_version_float(m.get("enrichment") or {}) for m in members) if v is not None]
-        top_version = max(versions) if versions else None
+        label = f"{family}{modality_suffix}"
 
-        for m in sorted(members, key=_curation_sort_key):
-            enr = m.get("enrichment") or {}
-            v = _version_float(enr)
-            purpose = enr.get("purpose") or "instruct"
-            alignment = enr.get("alignment") or "vanilla"
-            tier = _quant_tier(enr.get("quantization")) or "other"
-            # Slot keeps purpose-distinct keepers separately so a coder model
-            # and an instruct model in the same family don't redunds-each-other.
-            slot = f"{purpose}/{alignment}/{tier}"
-            decision = None
-            reason = None
-
-            if top_version is not None and v is not None and v < top_version:
-                decision = "supersede"
-                reason = f"version {v:g} < newest in family ({top_version:g})"
-            else:
-                # Within the top version: first entry per (alignment, tier)
-                # slot in sort order is the keeper; rest are redundant.
-                # We piggy-back on the per-group iteration order (already
-                # sorted) using a slot-seen marker stored on the group.
-                seen = m.setdefault("_curation_slot_seen", None)  # noqa
-                # Use a closure-local dict via the group instead.
-                pass
-
+        # Bucket by slot. Same slot = competing entries (newer version wins,
+        # others either superseded by version or redundant within version).
+        # Different slots = different niches (different size class, dense vs
+        # MoE, different alignment, different quant tier). Both can be kept.
+        by_slot = {}
+        for m in members:
+            slot = _slot_key(m)
             m["curation"] = {
                 "group": label,
-                "decision": decision,
                 "slot": slot,
-                "reason": reason,
+                "decision": None,
+                "reason": None,
             }
+            by_slot.setdefault(slot, []).append(m)
 
-    # Second pass per group: assign keep / redundant within top-version slots.
-    # The _curation_slot_seen scratchpad above wasn't ideal; redo cleanly here.
-    for _key, members in by_group.items():
-        sorted_members = sorted(members, key=_curation_sort_key)
-        slot_taken = set()
-        for m in sorted_members:
-            cur = m.get("curation")
-            if cur is None or cur["decision"] == "supersede":
-                continue
-            slot = cur["slot"]
-            if slot in slot_taken:
-                cur["decision"] = "redundant"
-                cur["reason"] = f"same slot ({slot}) already filled by a higher-ranked keeper"
-            else:
-                slot_taken.add(slot)
-                cur["decision"] = "keep"
-                cur["reason"] = "best in slot"
+        for slot, slot_members in by_slot.items():
+            # Sort newest-first using the recommendation tuple.
+            sorted_members = sorted(slot_members, key=_curation_sort_key)
+            top_version = None
+            for sm in sorted_members:
+                v = _version_float(sm.get("enrichment") or {})
+                if v is not None:
+                    top_version = v
+                    break
+
+            kept = False
+            for sm in sorted_members:
+                cur = sm["curation"]
+                v = _version_float(sm.get("enrichment") or {})
+                if top_version is not None and v is not None and v < top_version:
+                    cur["decision"] = "supersede"
+                    cur["reason"] = f"version {v:g} superseded in this slot by {top_version:g}"
+                elif not kept:
+                    cur["decision"] = "keep"
+                    cur["reason"] = "best in slot"
+                    kept = True
+                else:
+                    cur["decision"] = "redundant"
+                    cur["reason"] = f"same slot ({slot}) already filled by a higher-ranked keeper"
 
 def enrich_entry(entry, snapshot_path=None):
     """Augment a discovered-item record with parsed metadata.
@@ -1933,7 +1982,13 @@ _PURPOSE_DISPLAY_ORDER = (
 )
 
 def _identity_string(enr):
-    """Compose a compact identity string from enrichment fields."""
+    """Compose a compact identity string from enrichment fields.
+
+    Form: "<family> <version> <size> <arch> <alignment-or-vanilla> <caps>".
+    Architecture is appended as 'dense' or 'MoE A4B' (carrying the active-
+    params suffix when MoE) so the dense vs MoE distinction is visible at
+    a glance, immediately after the size class.
+    """
     parts = []
     if enr.get("family"):
         parts.append(enr["family"])
@@ -1941,8 +1996,7 @@ def _identity_string(enr):
         parts.append(enr["version"])
     if enr.get("size"):
         parts.append(enr["size"])
-    if enr.get("moe_active"):
-        parts.append(enr["moe_active"])
+    parts.append(_arch_label(enr))
     parts.append(enr.get("alignment") or "vanilla")
     if enr.get("capabilities"):
         parts.append("+".join(enr["capabilities"]))
@@ -2015,18 +2069,28 @@ def format_curation_grid(sections, ad_hoc):
 
     purposes = list(_PURPOSE_DISPLAY_ORDER) + sorted(p for p in by_purpose if p not in _PURPOSE_DISPLAY_ORDER)
 
+    # Column widths — chosen so the grid fits in ~150 cols. Values that
+    # would overflow are explicitly truncated below; subsequent columns
+    # therefore stay aligned regardless of input length.
+    W_ID, W_RUN, W_QUANT, W_SIZE, W_UPD, W_CT, W_DEC, W_FROM = 46, 12, 11, 7, 11, 8, 10, 32
+
     for purpose in purposes:
         members = by_purpose.get(purpose) or []
         if not members:
             continue
-        # Sort within a purpose group: family alphabetical first so every
-        # entry for one family stays together; within a family the existing
-        # recommendation tuple takes over (newer version, vanilla before
-        # alignment, higher precision, mlx > gguf, more recently updated).
+        # Sort within a purpose group: family asc, then size class numeric
+        # (small to large reads naturally), then dense before MoE within
+        # the same size class, then exact size, then the recommendation
+        # tuple (newest version, vanilla before alignment, higher precision,
+        # mlx-runner first, more recently updated).
         def _grid_key(pair):
             _app, e = pair
-            fam = ((e.get("enrichment") or {}).get("family") or "~").lower()
-            return (fam,) + _curation_sort_key(e)
+            enr = e.get("enrichment") or {}
+            fam = (enr.get("family") or "~").lower()
+            size_n = _size_numeric(enr.get("size") or "") or 0.0
+            size_class_n = _size_class_numeric(enr.get("size") or "")
+            arch_rank = 1 if enr.get("moe_active") else 0  # dense first
+            return (fam, size_class_n, arch_rank, size_n) + _curation_sort_key(e)
         members.sort(key=_grid_key)
         n = len(members)
         total = sum(e["size"] for _, e in members)
@@ -2036,25 +2100,27 @@ def format_curation_grid(sections, ad_hoc):
         out.append("")
         out.append(f"[{purpose.upper()}] · {n} entries · {_human_size(total)} · {keepers} keep · {prunes} prune")
         out.append(
-            f"  {'Identity':<46} {'Runner':<10} {'Quant':<7} {'Size':>7} {'Updated':<11} {'CT':<8} "
-            f"{tool_header}  Decision"
+            f"  {'Identity':<{W_ID}} {'Runner':<{W_RUN}} {'Quant':<{W_QUANT}} {'Size':>{W_SIZE}} "
+            f"{'Updated':<{W_UPD}} {'CT':<{W_CT}} {tool_header}  {'Decision':<{W_DEC}} From"
         )
-        out.append("  " + "─" * 130)
+        out.append("  " + "─" * 150)
 
         for app, e in members:
             enr = e.get("enrichment") or {}
             cur = e.get("curation") or {}
-            ident = _identity_string(enr)[:46]
-            runner = enr.get("runner") or ""
-            quant = enr.get("quantization") or "—"
+            ident = _identity_string(enr)[:W_ID]
+            runner = (enr.get("runner") or "")[:W_RUN]
+            quant = (enr.get("quantization") or "—")[:W_QUANT]
             size_h = _human_size(e.get("size") or 0)
-            updated = enr.get("last_modified") or ""
+            updated = (enr.get("last_modified") or "")[:W_UPD]
             ct = enr.get("chat_template")
-            ct_short = ct[:8] if ct else ""
-            decision = cur.get("decision") or "—"
+            ct_short = (ct[:8] if ct else "")
+            decision = (cur.get("decision") or "—")[:W_DEC]
+            bm = enr.get("base_model") or ""
+            if len(bm) > W_FROM:
+                bm = bm[:W_FROM - 1] + "…"
 
-            # Determine tool marks for this row. ● means stored, ✓ means
-            # compatible-but-not-stored.
+            # Determine tool marks for this row.
             stored_tools = set()
             for app_name in id_to_apps.get(e.get("id") or "", set()):
                 tc = _APP_TO_TOOL.get(app_name)
@@ -2063,7 +2129,7 @@ def format_curation_grid(sections, ad_hoc):
             tc_for_app = _APP_TO_TOOL.get(app)
             if tc_for_app:
                 stored_tools.add(tc_for_app)
-            compat_tools = set(_RUNNER_COMPAT.get(runner, set()))
+            compat_tools = set(_RUNNER_COMPAT.get(enr.get("runner"), set()))
 
             row_tool_cells = []
             for tc in tool_codes:
@@ -2077,13 +2143,9 @@ def format_curation_grid(sections, ad_hoc):
             tool_marks = " ".join(row_tool_cells)
 
             out.append(
-                f"  {ident:<46} {runner:<10} {quant:<7} {size_h:>7} {updated:<11} {ct_short:<8} "
-                f"{tool_marks}  {decision}"
+                f"  {ident:<{W_ID}} {runner:<{W_RUN}} {quant:<{W_QUANT}} {size_h:>{W_SIZE}} "
+                f"{updated:<{W_UPD}} {ct_short:<{W_CT}} {tool_marks}  {decision:<{W_DEC}} {bm}"
             )
-            # Show base_model lineage as a faint sub-line where present.
-            bm = enr.get("base_model")
-            if bm:
-                out.append(f"      └─ from {bm}")
 
     # Legend.
     out.append("")
