@@ -190,6 +190,20 @@ def resolve_hf_snapshot(hub_dir, publisher, name):
     snapshot_path = model_root / "snapshots" / sha
     return snapshot_path if snapshot_path.exists() else None
 
+def resolve_lm_studio_models_dir():
+    """Locate LM Studio's models/ directory cross-platform.
+
+    Honors the ~/.lmstudio-home-pointer redirect file (a plaintext one-liner
+    holding the LM Studio home dir) used on macOS, Linux, and Windows alike.
+    Falls back to the platform-default ~/.lmstudio/ when no pointer exists.
+    """
+    pointer = Path(os.path.expanduser("~/.lmstudio-home-pointer"))
+    if pointer.exists():
+        home = Path(pointer.read_text().strip()).expanduser()
+    else:
+        home = Path(os.path.expanduser("~/.lmstudio"))
+    return home / "models"
+
 def scan_lmstudio_models(lm_studio_dir):
     """Yield (publisher, name, model_dir, model_type) for each MLX/GGUF model in LM Studio."""
     results = []
@@ -323,7 +337,7 @@ def mirror_to_huggingface(types, reuse_local=True):
         os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
     )
     hub_dir = cache_dir / "hub"
-    lm_studio_dir = Path(os.path.expanduser("~/.cache/lm-studio/models"))
+    lm_studio_dir = resolve_lm_studio_models_dir()
 
     if not lm_studio_dir.exists():
         print(f"No LM Studio models directory at {lm_studio_dir}")
