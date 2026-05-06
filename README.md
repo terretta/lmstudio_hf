@@ -5,7 +5,7 @@ A command-line utility to manage MLX models between your Hugging Face cache and 
 ## Features
 
 - Interactive model selection interface with keyboard navigation
-- Two flows: `import` (HF cache → LM Studio) and `mirror` (LM Studio → HF cache, then symlink back)
+- Three flows: `import` (HF cache → LM Studio), `mirror` (LM Studio → HF cache, then symlink back), `discover` (read-only inventory across local apps)
 - Automatic detection of MLX (and optionally GGUF) models
 - Smart handling of model imports via per-file symbolic links
 - Support for model replacement and removal
@@ -40,6 +40,7 @@ uv run lmstudio_hf.py mirror            # mirror flow, MLX only, smart-reuse on
 uv run lmstudio_hf.py mirror --type gguf
 uv run lmstudio_hf.py mirror --type both
 uv run lmstudio_hf.py mirror --no-reuse # always re-download, skip local hash check
+uv run lmstudio_hf.py discover          # inventory HF-compatible models across local apps
 ```
 
 Remote execution against the raw script URL also works:
@@ -58,6 +59,13 @@ uv run https://raw.githubusercontent.com/ivanfioravanti/lmstudio_hf/main/lmstudi
   Defaults to MLX only; pass `--type gguf` or `--type both` to widen scope. Models
   already symlinked are skipped, and models not present on the Hub are reported and
   left untouched.
+- **`discover`** — read-only inventory of HF-compatible models cached by other apps
+  on this machine. Stats known cache locations (Hugging Face, LM Studio, Ollama,
+  GPT4All, Jan, Msty, AnythingLLM, ComfyUI, Draw Things, Diffusion Bee), plus a
+  Spotlight (`mdfind`) sweep on macOS for `*.safetensors`/`*.gguf` files outside
+  those caches. Classifies leftover hits by parent-directory pattern (sandboxed
+  apps, app support dirs, iCloud Drive, external volumes, etc.). No network calls,
+  no file modifications.
 
 ### Navigation Controls
 
@@ -85,6 +93,27 @@ uv run https://raw.githubusercontent.com/ivanfioravanti/lmstudio_hf/main/lmstudi
 6. Atomically replaces each chosen LM Studio model directory with per-file symlinks pointing into the HF snapshot. The original is held under a `<name>.old` sibling until the new symlink tree lands, then removed. Models are processed one at a time, so peak temporary disk usage is roughly one model's worth — not the full batch.
 
 Pass `--no-reuse` to skip the hash-and-ingest step and force a full re-download. Useful if you suspect local files are corrupt.
+
+### `discover` flow
+
+1. Stats a registry of known cache locations:
+   - Hugging Face cache (`$HF_HOME` or `~/.cache/huggingface/hub/`) — also covers `mlx-lm`, `mlx_vlm`, `mflux`, `vLLM`, and any other `huggingface_hub`-based tool, since they all share this cache.
+   - LM Studio (resolved via `~/.lmstudio-home-pointer`).
+   - Ollama (`$OLLAMA_MODELS` or `~/.ollama/models/`).
+   - GPT4All, Jan, Msty, AnythingLLM, ComfyUI, Draw Things, Diffusion Bee — each at its conventional path on macOS / Linux / Windows.
+2. Runs each cache's scanner (HF cache walks `models--<pub>--<name>/`; Ollama walks manifests to find GGUF blobs; the rest do a recursive file scan with size threshold) and reports the contents.
+3. On macOS, runs `mdfind` once for `*.safetensors`/`*.gguf` files larger than 10 MB. Anything that lives under one of the known cache roots is dropped (already accounted for); the rest is classified by path pattern:
+   - sandboxed apps (`~/Library/Containers/<bundle-id>/...`)
+   - iCloud Drive (legacy `~/Library/Mobile Documents/...` and modern `~/Library/CloudStorage/...`)
+   - app support / cache dirs
+   - HF-cache-format blob layouts dropped at non-canonical locations
+   - tool-named directories (substring match: `comfyui`, `ollama`, `mlx`, `llama.cpp`, etc.)
+   - external volumes (`/Volumes/...`)
+   - common user folders (`Downloads`, `Desktop`, `Documents/...`)
+   - truly unclassified
+4. Prints a sectioned report. No network calls, no file modifications.
+
+`discover` is read-only by design — it's an inventory tool, not an action tool. Future versions may pipe its output into `mirror` for cross-app deduplication.
 
 ## Environment Variables
 

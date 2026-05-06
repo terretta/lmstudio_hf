@@ -9,6 +9,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import subprocess
 import sys
 import shutil
 
@@ -432,8 +434,481 @@ def mirror_to_huggingface(types, reuse_local=True):
             print(f"\n  Failed to mirror {repo_id}: {e}", flush=True)
             continue
 
+# ---------------------------------------------------------------------------
+# discover: read-only inventory of HF-compatible models cached by other apps
+# ---------------------------------------------------------------------------
+
+# Minimum file size for a "real" model weight; smaller files are placeholders,
+# stubs (iCloud/Dropbox cloud-only), or metadata.
+_DISCOVER_MIN_BYTES = 10 * 1024 * 1024
+
+# Bundle ids of sandboxed apps whose container paths we want to label nicely
+# when they show up in mdfind results.
+_KNOWN_BUNDLE_IDS = {
+    "com.liuliu.draw-things": "Draw Things",
+    "com.numericcal.privatellm": "Private LLM",
+}
+
+# Substrings used by the path-pattern classifier to recognize tool-named dirs.
+_TOOL_NAME_HINTS = ("comfyui", "ollama", "mlx", "llama.cpp", "lm-studio", "lmstudio", "huggingface")
+
+# File extensions that we treat as HF-compatible model weights.
+_MODEL_EXTENSIONS = (".safetensors", ".gguf", ".ckpt")
+
+
+def _human_size(n):
+    """Render byte count as a short human-readable string."""
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024.0 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} PB"
+
+def _friendly(path):
+    """Render a Path with $HOME collapsed to '~' for compact display."""
+    s = str(path)
+    home = str(Path.home())
+    if s == home:
+        return "~"
+    if s.startswith(home + "/"):
+        return "~" + s[len(home):]
+    return s
+
+def _dir_size(path):
+    """Sum file sizes under path, following symlinks. Tolerates errors."""
+    total = 0
+    try:
+        for p in path.rglob("*"):
+            try:
+                if p.is_file():
+                    total += p.stat().st_size
+            except OSError:
+                continue
+    except Exception:
+        pass
+    return total
+
+def scan_hf_cache(hub_dir):
+    """Yield records for each repo under a Hugging Face cache hub/ directory."""
+    out = []
+    if not hub_dir.exists():
+        return out
+    for entry in sorted(hub_dir.iterdir()):
+        if not entry.is_dir() or not entry.name.startswith("models--"):
+            continue
+        parts = entry.name.split("--", 2)
+        if len(parts) != 3:
+            continue
+        publisher, repo = parts[1], parts[2]
+        snapshot = resolve_hf_snapshot(hub_dir, publisher, repo)
+        if snapshot is None:
+            continue
+        formats = set()
+        for f in snapshot.rglob("*"):
+            if f.name.startswith(".") or not f.is_file():
+                continue
+            ext = f.suffix.lower()
+            if ext in _MODEL_EXTENSIONS:
+                formats.add(ext.lstrip("."))
+        fmt = "+".join(sorted(formats)) if formats else "other"
+        out.append({
+            "app": "Hugging Face cache",
+            "id": f"{publisher}/{repo}",
+            "path": snapshot,
+            "format": fmt,
+            "size": _dir_size(entry),
+        })
+    return out
+
+def scan_ollama_models(ollama_dir):
+    """Walk Ollama manifests and yield (family:tag, gguf_blob, size) records."""
+    out = []
+    manifests_root = ollama_dir / "manifests"
+    if not manifests_root.exists():
+        return out
+    # Layout: manifests/<registry>/<namespace>/<family>/<tag>
+    for tag_path in manifests_root.rglob("*"):
+        if not tag_path.is_file():
+            continue
+        try:
+            manifest = json.loads(tag_path.read_text())
+        except Exception:
+            continue
+        layer = next(
+            (l for l in manifest.get("layers", [])
+             if l.get("mediaType") == "application/vnd.ollama.image.model"),
+            None,
+        )
+        if not layer:
+            continue
+        digest = layer.get("digest", "")
+        if not digest.startswith("sha256:"):
+            continue
+        blob = ollama_dir / "blobs" / digest.replace(":", "-")
+        try:
+            size = blob.stat().st_size
+        except OSError:
+            continue
+        family = tag_path.parent.name
+        tag = tag_path.name
+        out.append({
+            "app": "Ollama",
+            "id": f"{family}:{tag}",
+            "path": blob,
+            "format": "gguf",
+            "size": size,
+        })
+    return out
+
+def scan_flat_dir(root, app_name, extensions=_MODEL_EXTENSIONS):
+    """Recursively list HF-compatible model files under root, with size filter."""
+    out = []
+    if not root.exists() or not root.is_dir():
+        return out
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.name.startswith("."):
+            continue
+        if path.suffix.lower() not in extensions:
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size < _DISCOVER_MIN_BYTES:
+            continue
+        out.append({
+            "app": app_name,
+            "id": path.name,
+            "path": path,
+            "format": path.suffix.lower().lstrip("."),
+            "size": size,
+        })
+    return out
+
+def scan_mdfind():
+    """Run mdfind on macOS for safetensors/gguf paths above the size threshold.
+
+    Returns (paths_with_sizes, note_or_None).
+    """
+    if sys.platform != "darwin":
+        return [], "Tier 2 (mdfind) is macOS-only; skipped."
+    if os.environ.get("LMSTUDIO_HF_NO_MDFIND"):
+        return [], "Tier 2 (mdfind) skipped (LMSTUDIO_HF_NO_MDFIND set)."
+    try:
+        result = subprocess.run(
+            ["mdfind", 'kMDItemFSName == "*.safetensors" || kMDItemFSName == "*.gguf"'],
+            capture_output=True, text=True, timeout=120,
+        )
+    except Exception as e:
+        return [], f"Tier 2 (mdfind) failed: {e}"
+    out = []
+    for line in result.stdout.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        p = Path(s)
+        try:
+            if not p.is_file() or p.is_symlink():
+                continue
+            size = p.stat().st_size
+        except OSError:
+            continue
+        if size >= _DISCOVER_MIN_BYTES:
+            out.append((p, size))
+    return out, None
+
+def _tool_hint_in(s_lower):
+    """Return the first tool-name substring matching s_lower, or None."""
+    for tool in _TOOL_NAME_HINTS:
+        if f"/{tool}/" in s_lower or f"/.{tool}/" in s_lower:
+            return tool
+    return None
+
+def infer_source_from_path(path):
+    """Examine an mdfind hit's path and return a structured origin guess."""
+    s = str(path)
+    home = str(Path.home())
+
+    # Sandboxed apps — most specific first.
+    m = re.match(rf"^{re.escape(home)}/Library/Containers/([^/]+)/", s)
+    if m:
+        bundle = m.group(1)
+        label = _KNOWN_BUNDLE_IDS.get(bundle, bundle)
+        return {"kind": "sandbox", "label": label, "evidence": bundle}
+
+    # iCloud Drive — both legacy ("Mobile Documents") and modern ("CloudStorage")
+    # mount points. Append a tool-name hint when one appears in the relative path,
+    # so "iCloud Drive / .../ComfyUI/..." surfaces as "iCloud Drive / comfyui".
+    icloud_legacy = f"{home}/Library/Mobile Documents/com~apple~CloudDocs/"
+    if s.startswith(icloud_legacy):
+        rest = s[len(icloud_legacy):]
+        tool = _tool_hint_in("/" + rest.lower())
+        first = rest.split("/", 1)[0] if rest else "(root)"
+        label = f"iCloud Drive / {tool}" if tool else f"iCloud Drive / {first}"
+        return {"kind": "cloud_sync", "label": label, "evidence": icloud_legacy}
+
+    if s.startswith(f"{home}/Library/CloudStorage/"):
+        rest = s[len(f"{home}/Library/CloudStorage/"):]
+        provider = rest.split("/", 1)[0] if rest else "(root)"
+        tool = _tool_hint_in("/" + rest.lower())
+        label = f"{provider} / {tool}" if tool else provider
+        return {"kind": "cloud_sync", "label": label,
+                "evidence": f"~/Library/CloudStorage/{provider}/"}
+
+    # Other Library-internal locations.
+    m = re.match(rf"^{re.escape(home)}/Library/Application Support/([^/]+)/", s)
+    if m:
+        return {"kind": "app_support", "label": m.group(1),
+                "evidence": f"~/Library/Application Support/{m.group(1)}/"}
+
+    m = re.match(rf"^{re.escape(home)}/Library/Caches/([^/]+)/", s)
+    if m:
+        return {"kind": "app_cache", "label": m.group(1),
+                "evidence": f"~/Library/Caches/{m.group(1)}/"}
+
+    # HF blob layout dropped at a non-canonical location.
+    m = re.search(r"models--[^/]+--[^/]+/blobs/", s)
+    if m:
+        idx = s.rfind("models--", 0, m.end())
+        end = s.find("/blobs/", idx)
+        return {"kind": "hf_format", "label": "HF-cache-format",
+                "evidence": s[: end] if end != -1 else s}
+
+    # External volumes.
+    if s.startswith("/Volumes/"):
+        vol = s[len("/Volumes/"):].split("/", 1)[0]
+        tool = _tool_hint_in(s.lower())
+        label = f"{vol} / {tool}" if tool else vol
+        return {"kind": "external_volume", "label": label,
+                "evidence": f"/Volumes/{vol}/"}
+
+    # Tool-named directory anywhere else.
+    tool = _tool_hint_in(s.lower())
+    if tool:
+        return {"kind": "tool_named", "label": tool, "evidence": _friendly(path.parent)}
+
+    # Common user folders.
+    for d in ("Downloads", "Desktop"):
+        if s.startswith(f"{home}/{d}/"):
+            return {"kind": "user_download", "label": d, "evidence": f"~/{d}/"}
+
+    if s.startswith(f"{home}/Documents/"):
+        rel = s[len(f"{home}/Documents/"):].split("/", 1)[0]
+        return {"kind": "user_curated", "label": f"Documents/{rel}",
+                "evidence": f"~/Documents/{rel}/"}
+
+    return {"kind": "unclassified", "label": None, "evidence": _friendly(path.parent)}
+
+def _format_known_section(section):
+    """Render one known-cache section."""
+    app = section["app"]
+    status = section["status"]
+    paths = ", ".join(_friendly(p) for p in section["paths"])
+    if status == "not present":
+        return [f"[{app}]   not present"]
+    if status.startswith("scan failed"):
+        return [f"[{app}]   {paths}   {status}"]
+    items = section["items"]
+    total = sum(i["size"] for i in items)
+    label = "repo" if app == "Hugging Face cache" else "model"
+    plural = "" if len(items) == 1 else "s"
+    out = [f"[{app}]   {paths}   {len(items)} {label}{plural} · {_human_size(total)}"]
+    if section.get("note"):
+        out.append(f"  {section['note']}")
+    for i in items:
+        extra = ""
+        if i.get("extra", {}).get("symlinked"):
+            extra = ", symlinked → HF cache"
+        out.append(f"  - {i['id']} ({i['format']}, {_human_size(i['size'])}{extra})")
+    return out
+
+def _format_ad_hoc_section(ad_hoc, mdfind_total, already_known, mdfind_note):
+    """Render the 'Outside known caches' section."""
+    out = ["", "[Outside known caches]   via mdfind, classified by path pattern"]
+    if mdfind_note:
+        out.append(f"  {mdfind_note}")
+    if not ad_hoc:
+        out.append("  (none)")
+        return out
+    by_kind = {}
+    for f in ad_hoc:
+        by_kind.setdefault(f["inferred"]["kind"], []).append(f)
+    kind_order = [
+        ("sandbox",         "Sandboxed apps (containers)"),
+        ("app_support",     "App Support directories"),
+        ("app_cache",       "App Caches"),
+        ("hf_format",       "HF-cache-format at non-canonical locations"),
+        ("tool_named",      "Tool-named directories"),
+        ("user_curated",    "User-curated personal storage"),
+        ("user_download",   "Manual downloads (unsorted)"),
+        ("cloud_sync",      "Cloud-synced (materialized locally)"),
+        ("external_volume", "External volumes"),
+        ("unclassified",    "Truly unclassified"),
+    ]
+    for kind, heading in kind_order:
+        files = by_kind.get(kind)
+        if not files:
+            continue
+        out.append("")
+        out.append(f"  {heading}:")
+        by_label = {}
+        for f in files:
+            label = f["inferred"]["label"] or "(unknown)"
+            by_label.setdefault(label, []).append(f)
+        for label in sorted(by_label):
+            lfiles = by_label[label]
+            total = sum(f["size"] for f in lfiles)
+            n = len(lfiles)
+            out.append(f"    {label}   ({n} file{'s' if n != 1 else ''}, {_human_size(total)})")
+            for f in lfiles[:5]:
+                out.append(f"      {_friendly(f['path'])}")
+            if n > 5:
+                out.append(f"      ... and {n - 5} more")
+    return out
+
+def format_discovery_report(sections, ad_hoc, mdfind_total, already_known, mdfind_note):
+    """Top-level report formatter."""
+    lines = []
+    for s in sections:
+        lines.extend(_format_known_section(s))
+        lines.append("")
+    lines.extend(_format_ad_hoc_section(ad_hoc, mdfind_total, already_known, mdfind_note))
+    lines.append("")
+    scanned = sum(1 for s in sections if s["status"] == "scanned")
+    total_known_items = sum(len(s.get("items", [])) for s in sections if s["status"] == "scanned")
+    lines.append("Summary:")
+    lines.append(f"  {total_known_items} model entr{'y' if total_known_items == 1 else 'ies'} across {scanned} active known cache{'s' if scanned != 1 else ''}")
+    lines.append(f"  Tier 2 mdfind: {mdfind_total} candidate{'s' if mdfind_total != 1 else ''} scanned, {already_known} already in known caches")
+    lines.append(f"  Tier 2 unique ad-hoc finds: {len(ad_hoc)}")
+    return "\n".join(lines)
+
+def discover():
+    """Inventory HF-compatible models cached by other apps on this machine."""
+    cache_dir = Path(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")))
+    hub_dir = cache_dir / "hub"
+
+    sections = []
+    known_roots = []
+
+    def add(app, paths, scan_fn, note=None):
+        present = [p for p in paths if p.exists()]
+        if not present:
+            sections.append({"app": app, "status": "not present", "paths": paths, "items": [], "note": note})
+            return
+        items = []
+        try:
+            for p in present:
+                known_roots.append(p)
+                items.extend(scan_fn(p))
+        except Exception as e:
+            sections.append({"app": app, "status": f"scan failed: {e}", "paths": present, "items": [], "note": note})
+            return
+        sections.append({"app": app, "status": "scanned", "paths": present, "items": items, "note": note})
+
+    add(
+        "Hugging Face cache",
+        [hub_dir],
+        scan_hf_cache,
+        note="shared by: mlx-lm, mlx_vlm, mflux, vLLM, transformers, huggingface_hub",
+    )
+
+    add(
+        "LM Studio",
+        [resolve_lm_studio_models_dir()],
+        lambda p: [
+            {
+                "app": "LM Studio",
+                "id": f"{pub}/{name}",
+                "path": model_dir,
+                "format": fmt,
+                "size": _dir_size(model_dir),
+                "extra": {"symlinked": is_already_symlinked(model_dir)},
+            }
+            for pub, name, model_dir, fmt in scan_lmstudio_models(p)
+        ],
+    )
+
+    ollama_dir = Path(os.environ.get("OLLAMA_MODELS", os.path.expanduser("~/.ollama/models")))
+    add("Ollama", [ollama_dir], scan_ollama_models)
+
+    add(
+        "GPT4All",
+        [
+            Path(os.path.expanduser("~/Library/Application Support/nomic.ai/GPT4All")),
+            Path(os.path.expanduser("~/.local/share/nomic.ai/GPT4All")),
+        ],
+        lambda p: scan_flat_dir(p, "GPT4All"),
+    )
+
+    add("Jan", [Path(os.path.expanduser("~/jan/models"))], lambda p: scan_flat_dir(p, "Jan"))
+
+    add("Msty", [Path(os.path.expanduser("~/.msty/models"))], lambda p: scan_flat_dir(p, "Msty"))
+
+    add(
+        "AnythingLLM",
+        [
+            Path(os.path.expanduser("~/Library/Application Support/AnythingLLM/storage/models")),
+            Path(os.path.expanduser("~/.config/AnythingLLM/storage/models")),
+        ],
+        lambda p: scan_flat_dir(p, "AnythingLLM"),
+    )
+
+    add(
+        "ComfyUI",
+        [
+            Path(os.path.expanduser("~/ComfyUI/models")),
+            Path(os.path.expanduser("~/Documents/ComfyUI/models")),
+        ],
+        lambda p: scan_flat_dir(p, "ComfyUI"),
+    )
+
+    add(
+        "Draw Things",
+        [Path(os.path.expanduser(
+            "~/Library/Containers/com.liuliu.draw-things/Data/Documents/Models"))],
+        lambda p: scan_flat_dir(p, "Draw Things"),
+    )
+
+    db_root = Path(os.path.expanduser("~/.diffusionbee"))
+    add(
+        "Diffusion Bee",
+        [db_root],
+        lambda p: (
+            scan_flat_dir(p / "imported_models", "Diffusion Bee")
+            + scan_flat_dir(p / "custom_models", "Diffusion Bee")
+            + scan_flat_dir(p / "downloads", "Diffusion Bee")
+        ),
+    )
+
+    mdfind_results, mdfind_note = scan_mdfind()
+
+    ad_hoc = []
+    already_known = 0
+    for path, size in mdfind_results:
+        is_known = False
+        for root in known_roots:
+            try:
+                path.relative_to(root)
+                is_known = True
+                break
+            except ValueError:
+                continue
+        if is_known:
+            already_known += 1
+            continue
+        ad_hoc.append({
+            "path": path,
+            "size": size,
+            "format": path.suffix.lower().lstrip("."),
+            "inferred": infer_source_from_path(path),
+        })
+
+    print(format_discovery_report(sections, ad_hoc, len(mdfind_results), already_known, mdfind_note))
+
+
 def main():
-    """Entry point: dispatch the import (default) or mirror subcommand."""
+    """Entry point: dispatch the import (default), mirror, or discover subcommand."""
     parser = argparse.ArgumentParser(
         prog="lmstudio-hf",
         description="Manage MLX/GGUF models between the Hugging Face cache and LM Studio.",
@@ -446,6 +921,7 @@ def main():
             "  uv run lmstudio_hf.py mirror --type gguf    # mirror GGUF models only\n"
             "  uv run lmstudio_hf.py mirror --type both    # mirror MLX and GGUF\n"
             "  uv run lmstudio_hf.py mirror --no-reuse     # force full re-download\n"
+            "  uv run lmstudio_hf.py discover              # inventory HF-compatible models across local apps\n"
             "\nRun `lmstudio_hf.py <command> --help` for full command options."
         ),
     )
@@ -482,10 +958,23 @@ def main():
         action="store_true",
         help="Disable sha256-verified ingestion of LM Studio's existing files into the HF blob store. By default, matching local files are reused so only missing pieces are downloaded.",
     )
+    sub.add_parser(
+        "discover",
+        help="List HF-compatible models cached by other apps on this machine.",
+        description=(
+            "Scan known model-cache locations (Hugging Face, LM Studio, Ollama, "
+            "GPT4All, Jan, Msty, AnythingLLM, ComfyUI, Draw Things, Diffusion Bee) "
+            "plus a Spotlight (mdfind) sweep on macOS for *.safetensors and *.gguf "
+            "files outside those caches. Read-only: prints a report, takes no "
+            "actions, makes no network calls."
+        ),
+    )
     args = parser.parse_args()
     if args.cmd == "mirror":
         types = {"mlx", "gguf"} if args.type == "both" else {args.type}
         mirror_to_huggingface(types, reuse_local=not args.no_reuse)
+    elif args.cmd == "discover":
+        discover()
     else:
         manage_models()
 
