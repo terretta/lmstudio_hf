@@ -5,6 +5,7 @@
 # ]
 # ///
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -206,6 +207,88 @@ def scan_lmstudio_models(lm_studio_dir):
             results.append((publisher_dir.name, model_dir.name, model_dir, mtype))
     return results
 
+def sha256_file(path, chunk_size=1 << 20):
+    """Stream sha256 of a file in 1 MiB chunks."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _lfs_sha256(sibling):
+    """Extract sha256 from a sibling's LFS metadata, tolerating dict or object form."""
+    lfs = getattr(sibling, "lfs", None)
+    if not lfs:
+        return None
+    if isinstance(lfs, dict):
+        return lfs.get("sha256")
+    return getattr(lfs, "sha256", None)
+
+def ingest_local_files_into_hf_cache(hub_dir, publisher, name, model_dir, repo_info):
+    """Move LFS-eligible local files into the HF cache blob layout when sha256 matches.
+
+    Returns (snapshot_path, ingested_count). Files whose hash doesn't match (or that
+    have no LFS hash to verify against) are left in model_dir; a subsequent
+    snapshot_download() will fetch what's missing. Mutates model_dir by removing
+    successfully-ingested files (their canonical home is now the HF blob store).
+    """
+    sha = repo_info.sha
+    target_root = hub_dir / f"models--{publisher}--{name}"
+    blobs_dir = target_root / "blobs"
+    snapshots_dir = target_root / "snapshots"
+    refs_dir = target_root / "refs"
+    blobs_dir.mkdir(parents=True, exist_ok=True)
+    snapshots_dir.mkdir(parents=True, exist_ok=True)
+    refs_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_path = snapshots_dir / sha
+    snapshot_path.mkdir(parents=True, exist_ok=True)
+
+    expected = {}
+    for sib in repo_info.siblings or []:
+        size = getattr(sib, "size", None)
+        sha256 = _lfs_sha256(sib)
+        expected[sib.rfilename] = (size, sha256)
+
+    ingested = 0
+    for entry in sorted(model_dir.iterdir()):
+        if entry.is_dir() or entry.is_symlink() or entry.name.startswith("."):
+            continue
+        if entry.name not in expected:
+            continue
+        exp_size, exp_sha = expected[entry.name]
+        if exp_sha is None:
+            continue  # not an LFS file; let snapshot_download fetch it
+        local_size = entry.stat().st_size
+        if exp_size is not None and exp_size != local_size:
+            continue
+
+        blob_path = blobs_dir / exp_sha
+        snapshot_link = snapshot_path / entry.name
+        rel_target = os.path.relpath(blob_path, snapshot_path)
+
+        if blob_path.exists():
+            if not snapshot_link.exists():
+                os.symlink(rel_target, snapshot_link)
+            entry.unlink()
+            ingested += 1
+            continue
+
+        gb = local_size / 1e9
+        print(f"  Hashing {entry.name} ({gb:.1f} GB)...")
+        actual = sha256_file(entry)
+        if actual != exp_sha:
+            print(f"    sha mismatch — will re-download")
+            continue
+        entry.rename(blob_path)
+        if snapshot_link.exists():
+            snapshot_link.unlink()
+        os.symlink(rel_target, snapshot_link)
+        ingested += 1
+        print(f"    matched, ingested as blob {exp_sha[:12]}")
+
+    (refs_dir / "main").write_text(sha)
+    return snapshot_path, ingested
+
 def replace_with_symlink_tree(model_dir, snapshot_path):
     """Replace model_dir's contents with per-file symlinks pointing into snapshot_path."""
     backup = model_dir.with_name(model_dir.name + ".old")
@@ -228,10 +311,13 @@ def replace_with_symlink_tree(model_dir, snapshot_path):
         raise
     shutil.rmtree(backup)
 
-def mirror_to_huggingface(types):
+def mirror_to_huggingface(types, reuse_local=True):
     """Scan LM Studio, ensure each model is in the HF cache, replace with symlinks.
 
     `types` is a set of model type strings to include, e.g. {"mlx"} or {"mlx", "gguf"}.
+    `reuse_local` enables sha256-verified ingestion of LM Studio's existing files
+    into the HF cache blob layout before downloading, so matching files are reused
+    instead of re-fetched.
     """
     cache_dir = Path(
         os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
@@ -311,12 +397,23 @@ def mirror_to_huggingface(types):
     from huggingface_hub import snapshot_download
     for _, publisher, name, model_dir, status, snapshot_path in selected:
         repo_id = f"{publisher}/{name}"
+        print(f"\n[{repo_id}]")
         try:
             if status == "needs_download":
-                print(f"Downloading {repo_id} ...")
+                if reuse_local:
+                    try:
+                        repo_info = api.model_info(repo_id, files_metadata=True)
+                        snapshot_path, ingested = ingest_local_files_into_hf_cache(
+                            hub_dir, publisher, name, model_dir, repo_info
+                        )
+                        if ingested:
+                            print(f"  Ingested {ingested} local file(s) into HF blob store")
+                    except Exception as e:
+                        print(f"  Could not ingest locally ({e}); falling back to full download")
+                print(f"  Downloading {repo_id} (skipping any blobs already cached)...")
                 snapshot_path = Path(snapshot_download(repo_id=repo_id, cache_dir=str(hub_dir)))
             replace_with_symlink_tree(model_dir, snapshot_path)
-            print(f"Mirrored {repo_id}")
+            print(f"  Mirrored {repo_id}")
         except Exception as e:
             print(f"  Failed to mirror {repo_id}: {e}")
             continue
@@ -333,10 +430,15 @@ def main():
         default="mlx",
         help="Model types to mirror (default: mlx, matching the import flow).",
     )
+    m.add_argument(
+        "--no-reuse",
+        action="store_true",
+        help="Disable sha256-verified ingestion of LM Studio's existing files into the HF blob store. By default, matching local files are reused so only missing pieces are downloaded.",
+    )
     args = parser.parse_args()
     if args.cmd == "mirror":
         types = {"mlx", "gguf"} if args.type == "both" else {args.type}
-        mirror_to_huggingface(types)
+        mirror_to_huggingface(types, reuse_local=not args.no_reuse)
     else:
         manage_models()
 

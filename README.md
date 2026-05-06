@@ -36,9 +36,10 @@ Run the script with `uv run` so dependencies declared in the script's PEP 723 he
 ```bash
 uv run lmstudio_hf.py                   # default: import flow
 uv run lmstudio_hf.py import            # explicit: import flow
-uv run lmstudio_hf.py mirror            # mirror flow, MLX only (default)
+uv run lmstudio_hf.py mirror            # mirror flow, MLX only, smart-reuse on
 uv run lmstudio_hf.py mirror --type gguf
 uv run lmstudio_hf.py mirror --type both
+uv run lmstudio_hf.py mirror --no-reuse # always re-download, skip local hash check
 ```
 
 Remote execution against the raw script URL also works:
@@ -76,13 +77,14 @@ uv run https://raw.githubusercontent.com/ivanfioravanti/lmstudio_hf/main/lmstudi
 
 ### `mirror` flow
 
-1. Scans `~/.cache/lm-studio/models/<publisher>/<name>/` for MLX (and optionally GGUF) models
-2. For each model, classifies as: already symlinked, in HF cache, downloadable from the Hub, or not on the Hub
-3. Presents the actionable subset in the picker; you choose which to mirror
-4. Downloads any missing snapshots into the HF cache via `huggingface_hub.snapshot_download`
-5. Atomically replaces each chosen LM Studio model directory with per-file symlinks pointing into the HF snapshot (the original is held under a `<name>.old` sibling until the new tree lands, then removed)
+1. Scans `~/.cache/lm-studio/models/<publisher>/<name>/` for MLX (and optionally GGUF) models.
+2. For each model, classifies as: already symlinked, in HF cache, downloadable from the Hub, or not on the Hub.
+3. Presents the actionable subset in the picker; you choose which to mirror.
+4. **Smart reuse (default).** For each chosen model, queries the Hub for file metadata, then for every local LFS file (e.g. `*.safetensors`) whose size matches the Hub's record, computes its sha256 and compares against the Hub's expected `lfs.sha256`. Files that match are renamed into the HF cache blob layout (`hub/models--<publisher>--<name>/blobs/<sha256>`) with a relative symlink in `snapshots/<sha>/`. No re-download for matched bytes. Files that don't match (or aren't LFS) fall through to step 5.
+5. Calls `huggingface_hub.snapshot_download`, which skips files already in the blob store and fetches only what's missing — typically just small metadata files (`config.json`, `tokenizer.json`, etc.) when ingestion succeeded.
+6. Atomically replaces each chosen LM Studio model directory with per-file symlinks pointing into the HF snapshot. The original is held under a `<name>.old` sibling until the new symlink tree lands, then removed. Models are processed one at a time, so peak temporary disk usage is roughly one model's worth — not the full batch.
 
-Peak temporary disk usage during a mirror is roughly the size of the model being processed, since the original files stay in place until the new symlink tree is built.
+Pass `--no-reuse` to skip the hash-and-ingest step and force a full re-download. Useful if you suspect local files are corrupt.
 
 ## Environment Variables
 
