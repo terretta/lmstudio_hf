@@ -1153,6 +1153,10 @@ def _format_enrichment_line(enrichment):
         parts.append(" ".join(fmt_q))
     if enrichment.get("chat_template"):
         parts.append(f"ct:{enrichment['chat_template'][:8]}")
+    if enrichment.get("last_modified"):
+        parts.append(f"updated:{enrichment['last_modified']}")
+    if enrichment.get("license"):
+        parts.append(enrichment["license"])
     if not parts:
         return None
     return " · ".join(parts)
@@ -1274,7 +1278,79 @@ def format_discovery_report(sections, ad_hoc, mdfind_total, already_known, mdfin
             lines.append(f"    {kind} / {label}: {n} file{'' if n == 1 else 's'} · {_human_size(sz)}")
     return "\n".join(lines)
 
-def discover():
+def _enrich_with_hub_metadata(sections):
+    """Augment HF-derived items with last_modified and license from the Hub.
+
+    Adds enrichment["last_modified"] (ISO-format date string) and
+    enrichment["license"] for entries whose id is a real HF repo_id. Caches
+    by repo_id so multiple entries pointing at the same repo (e.g. an HF
+    cache record AND a symlinked LM Studio record) only cost one API call.
+    Failures per repo are silent — the field stays None and the rest of
+    discover keeps working.
+    """
+    try:
+        from huggingface_hub import HfApi
+        from huggingface_hub.utils import (
+            GatedRepoError,
+            HfHubHTTPError,
+            RepositoryNotFoundError,
+        )
+    except Exception as e:
+        print(f"  (--hub-meta requires huggingface_hub: {e})", file=sys.stderr)
+        return
+    api = HfApi()
+    cache = {}
+
+    def lookup(repo_id):
+        if repo_id in cache:
+            return cache[repo_id]
+        try:
+            info = api.model_info(repo_id)
+            last_modified = None
+            if getattr(info, "last_modified", None):
+                last_modified = info.last_modified.date().isoformat()
+            license_ = None
+            cd = getattr(info, "card_data", None)
+            if cd is not None:
+                cd_dict = cd.to_dict() if hasattr(cd, "to_dict") else dict(cd)
+                license_ = cd_dict.get("license")
+            cache[repo_id] = {"last_modified": last_modified, "license": license_}
+        except (RepositoryNotFoundError, GatedRepoError):
+            cache[repo_id] = {"last_modified": None, "license": None}
+        except Exception:
+            cache[repo_id] = {"last_modified": None, "license": None}
+        return cache[repo_id]
+
+    targets = []  # (item, repo_id) pairs
+    for s in sections:
+        if s["status"] != "scanned":
+            continue
+        for item in s["items"]:
+            repo_id = None
+            if s["app"] in ("Hugging Face cache", "LM Studio"):
+                # id is already publisher/name
+                repo_id = item.get("id")
+            else:
+                # Ollama family: only the hf.co-pulled entries have HF metadata.
+                # The id for those is "<user>/<repo>:<tag>"; strip the tag.
+                extra = item.get("extra", {})
+                if extra.get("registry") in ("hf.co", "huggingface.co"):
+                    raw = item.get("id") or ""
+                    repo_id = raw.split(":", 1)[0] if ":" in raw else raw
+            if repo_id and "/" in repo_id:
+                targets.append((item, repo_id))
+
+    if not targets:
+        return
+
+    print(f"  (fetching Hub metadata for {len(targets)} repo{'' if len(targets) == 1 else 's'}...)", file=sys.stderr, flush=True)
+    for item, repo_id in targets:
+        meta = lookup(repo_id)
+        enr = item.setdefault("enrichment", {})
+        enr["last_modified"] = meta["last_modified"]
+        enr["license"] = meta["license"]
+
+def discover(hub_meta=False):
     """Inventory HF-compatible models cached by other apps on this machine."""
     cache_dir = Path(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")))
     hub_dir = cache_dir / "hub"
@@ -1480,6 +1556,9 @@ def discover():
             "status": _AD_HOC_ACTION.get(inferred["kind"], "gather_candidate"),
         })
 
+    if hub_meta:
+        _enrich_with_hub_metadata(sections)
+
     print(format_discovery_report(sections, ad_hoc, len(mdfind_results), already_known, mdfind_note))
 
 
@@ -1534,23 +1613,29 @@ def main():
         action="store_true",
         help="Disable sha256-verified ingestion of LM Studio's existing files into the HF blob store. By default, matching local files are reused so only missing pieces are downloaded.",
     )
-    sub.add_parser(
+    d = sub.add_parser(
         "discover",
         help="List HF-compatible models cached by other apps on this machine.",
         description=(
             "Scan known model-cache locations (Hugging Face, LM Studio, Ollama, "
-            "GPT4All, Jan, Msty, AnythingLLM, ComfyUI, Draw Things, Diffusion Bee) "
-            "plus a Spotlight (mdfind) sweep on macOS for *.safetensors and *.gguf "
-            "files outside those caches. Read-only: prints a report, takes no "
-            "actions, makes no network calls."
+            "GPT4All, Jan, Msty family, AnythingLLM, ComfyUI, Draw Things, "
+            "Diffusion Bee) plus a Spotlight (mdfind) sweep on macOS for "
+            "*.safetensors and *.gguf files outside those caches. Read-only: "
+            "prints a report, takes no actions. Network calls are opt-in via "
+            "--hub-meta."
         ),
+    )
+    d.add_argument(
+        "--hub-meta",
+        action="store_true",
+        help="Augment HF-derived entries with last_modified date and license from the Hugging Face Hub. One API call per unique repo_id.",
     )
     args = parser.parse_args()
     if args.cmd == "mirror":
         types = {"mlx", "gguf"} if args.type == "both" else {args.type}
         mirror_to_huggingface(types, reuse_local=not args.no_reuse)
     elif args.cmd == "discover":
-        discover()
+        discover(hub_meta=args.hub_meta)
     else:
         manage_models()
 
