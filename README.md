@@ -5,8 +5,9 @@ A command-line utility to manage MLX models between your Hugging Face cache and 
 ## Features
 
 - Interactive model selection interface with keyboard navigation
-- Automatic detection of MLX models in your Hugging Face cache
-- Smart handling of model imports via symbolic links
+- Two flows: `import` (HF cache → LM Studio) and `mirror` (LM Studio → HF cache, then symlink back)
+- Automatic detection of MLX (and optionally GGUF) models
+- Smart handling of model imports via per-file symbolic links
 - Support for model replacement and removal
 - Terminal-based UI with scrolling for large model lists
 
@@ -14,11 +15,12 @@ A command-line utility to manage MLX models between your Hugging Face cache and 
 
 - Python 3.x
 - LM Studio installed
-- Hugging Face models downloaded locally
+- [`uv`](https://docs.astral.sh/uv/) (for dependency resolution via the script's PEP 723 header)
+- Hugging Face models downloaded locally (only needed for the `import` flow)
 
 ## Installation
 
-You can skip this if you are using uvx remote execution (see below).
+You can skip this if you are running the script remotely via `uv run` (see below).
 
 1. Clone this repository:
 ```bash
@@ -28,30 +30,59 @@ cd lmstudio_hf
 
 ## Usage
 
-Run the script using Python:
+Run the script with `uv run` so dependencies declared in the script's PEP 723 header
+(currently `huggingface_hub`) are resolved automatically:
 
 ```bash
-python lmstudio_hf.py
+uv run lmstudio_hf.py                   # default: import flow
+uv run lmstudio_hf.py import            # explicit: import flow
+uv run lmstudio_hf.py mirror            # mirror flow, MLX only (default)
+uv run lmstudio_hf.py mirror --type gguf
+uv run lmstudio_hf.py mirror --type both
 ```
 
-Alternatively, you can use uvx remote execution:
+Remote execution against the raw script URL also works:
+
 ```bash
-uvx git+https://github.com/ivanfioravanti/lmstudio_hf
+uv run https://raw.githubusercontent.com/ivanfioravanti/lmstudio_hf/main/lmstudio_hf.py mirror
 ```
+
+### Subcommands
+
+- **`import`** (default) — scans your Hugging Face cache for MLX models and creates
+  symlinks in `~/.cache/lm-studio/models/` so LM Studio can use them.
+- **`mirror`** — scans `~/.cache/lm-studio/models/` for models, ensures each is in
+  the Hugging Face cache (downloading from the Hub if missing), then replaces each
+  LM Studio model directory with per-file symlinks pointing into the HF snapshot.
+  Defaults to MLX only; pass `--type gguf` or `--type both` to widen scope. Models
+  already symlinked are skipped, and models not present on the Hub are reported and
+  left untouched.
 
 ### Navigation Controls
 
 - ↑/↓ arrows: Navigate through the model list
 - SPACE: Select/deselect a model
-- ENTER: Confirm selection and proceed with import
+- ENTER: Confirm selection and proceed
 - Ctrl+C: Cancel operation
 
 ## How It Works
 
-1. The tool scans your Hugging Face cache directory (`~/.cache/huggingface` by default)
-2. Identifies MLX-compatible models (excluding specific types like Whisper, LLaVA, etc.)
+### `import` flow
+
+1. Scans your Hugging Face cache directory (`~/.cache/huggingface` by default)
+2. Identifies MLX-compatible models (`mlx-community` namespace)
 3. Creates symbolic links in the LM Studio models directory (`~/.cache/lm-studio/models`)
 4. Allows for easy management of existing imports
+
+### `mirror` flow
+
+1. Scans `~/.cache/lm-studio/models/<publisher>/<name>/` for MLX (and optionally GGUF) models
+2. For each model, classifies as: already symlinked, in HF cache, downloadable from the Hub, or not on the Hub
+3. Presents the actionable subset in the picker; you choose which to mirror
+4. Downloads any missing snapshots into the HF cache via `huggingface_hub.snapshot_download`
+5. Atomically replaces each chosen LM Studio model directory with per-file symlinks pointing into the HF snapshot (the original is held under a `<name>.old` sibling until the new tree lands, then removed)
+
+Peak temporary disk usage during a mirror is roughly the size of the model being processed, since the original files stay in place until the new symlink tree is built.
 
 ## Environment Variables
 
@@ -69,4 +100,4 @@ Feel free to open issues or submit pull requests for any improvements or bug fix
 
 ## License
 
-[MIT License](LICENSE) 
+[MIT License](LICENSE)
