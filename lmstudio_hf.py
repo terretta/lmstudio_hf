@@ -119,11 +119,13 @@ def manage_models():
 
     # Create list of models with their current import status
     model_choices = []
-    for model_type, model, snapshot_path in sorted(found_models):
+    sorted_models = sorted(found_models)
+    type_w = max((len(f"({mt})") for mt, _, _ in sorted_models), default=0)
+    for model_type, model, snapshot_path in sorted_models:
         target_path = lm_studio_dir / f"{model}"
         is_imported = target_path.exists()
         status = " (already imported)" if is_imported else ""
-        display_name = f"({model_type}) {model}{status}"
+        display_name = f"{f'({model_type})'.ljust(type_w)} {model}{status}"
         model_choices.append((display_name, model, is_imported, snapshot_path))
 
     # Show interactive selection menu
@@ -294,9 +296,10 @@ def mirror_to_huggingface(types):
         return
 
     model_choices = []
+    type_w = max((len(f"({c[3]})") for c in actionable), default=0)
     for publisher, name, model_dir, mtype, status, snapshot_path in actionable:
         label = "in HF cache, will symlink" if status == "in_hf_cache" else "will download from HF"
-        display_name = f"({mtype}) {publisher}/{name} [{label}]"
+        display_name = f"{f'({mtype})'.ljust(type_w)} {publisher}/{name} [{label}]"
         model_choices.append((display_name, publisher, name, model_dir, status, snapshot_path))
 
     selected = select_models(model_choices)
