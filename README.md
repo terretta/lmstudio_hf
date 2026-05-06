@@ -60,8 +60,8 @@ uv run https://raw.githubusercontent.com/ivanfioravanti/lmstudio_hf/main/lmstudi
 
 ### Navigation Controls
 
-- ↑/↓ arrows: Navigate through the model list
-- SPACE: Select/deselect a model
+- ↑/↓ arrows: Navigate through the model list (the first row is a "Select all" toggle)
+- SPACE: Select/deselect the current row; on the "Select all" row, toggles every model at once
 - ENTER: Confirm selection and proceed
 - Ctrl+C: Cancel operation
 

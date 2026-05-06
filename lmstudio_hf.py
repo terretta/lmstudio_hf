@@ -12,28 +12,43 @@ import sys
 import shutil
 
 def select_models(model_choices):
-    selected = [False] * len(model_choices)
-    idx = 0
+    n = len(model_choices)
+    if n == 0:
+        return []
+    selected = [False] * n
+    idx = 0  # row 0 = "Select all", rows 1..n = model rows
+    total_rows = n + 1
     window_size = os.get_terminal_size().lines - 5
 
     while True:
         print("\033[H\033[J", end="")
         print("❯ lm-studio - Hugging Face Manage models \nAvailable models (↑/↓ to navigate, SPACE to select, ENTER to confirm, Ctrl+C to quit):")
 
-        window_start = max(0, min(idx - window_size + 3, len(model_choices) - window_size))
-        window_end = min(window_start + window_size, len(model_choices))
+        all_state = all(selected)
+        window_start = max(0, min(idx - window_size + 3, total_rows - window_size))
+        window_end = min(window_start + window_size, total_rows)
 
         for i in range(window_start, window_end):
-            display_name = model_choices[i][0]
-            print(f"{'>' if i == idx else ' '} {'◉' if selected[i] else '○'} {display_name}")
+            cursor = '>' if i == idx else ' '
+            if i == 0:
+                marker = '◉' if all_state else '○'
+                label = 'Select all'
+            else:
+                marker = '◉' if selected[i - 1] else '○'
+                label = model_choices[i - 1][0]
+            print(f"{cursor} {marker} {label}")
 
         key = get_key()
         if key == "\x1b[A":  # Up arrow
             idx = max(0, idx - 1)
         elif key == "\x1b[B":  # Down arrow
-            idx = min(len(model_choices) - 1, idx + 1)
+            idx = min(total_rows - 1, idx + 1)
         elif key == " ":
-            selected[idx] = not selected[idx]
+            if idx == 0:
+                new_state = not all(selected)
+                selected = [new_state] * n
+            else:
+                selected[idx - 1] = not selected[idx - 1]
         elif key == "\r":  # Enter key
             break
         elif key == "\x03":  # Ctrl+C
