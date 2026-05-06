@@ -274,17 +274,17 @@ def ingest_local_files_into_hf_cache(hub_dir, publisher, name, model_dir, repo_i
             continue
 
         gb = local_size / 1e9
-        print(f"  Hashing {entry.name} ({gb:.1f} GB)...")
+        print(f"  Hashing {entry.name} ({gb:.1f} GB)...", flush=True)
         actual = sha256_file(entry)
         if actual != exp_sha:
-            print(f"    sha mismatch — will re-download")
+            print(f"    sha mismatch — will re-download", flush=True)
             continue
         entry.rename(blob_path)
         if snapshot_link.exists():
             snapshot_link.unlink()
         os.symlink(rel_target, snapshot_link)
         ingested += 1
-        print(f"    matched, ingested as blob {exp_sha[:12]}")
+        print(f"    matched, ingested as blob {exp_sha[:12]}", flush=True)
 
     (refs_dir / "main").write_text(sha)
     return snapshot_path, ingested
@@ -397,7 +397,7 @@ def mirror_to_huggingface(types, reuse_local=True):
     from huggingface_hub import snapshot_download
     for _, publisher, name, model_dir, status, snapshot_path in selected:
         repo_id = f"{publisher}/{name}"
-        print(f"\n[{repo_id}]")
+        print(f"\n[{repo_id}]", flush=True)
         try:
             if status == "needs_download":
                 if reuse_local:
@@ -407,15 +407,15 @@ def mirror_to_huggingface(types, reuse_local=True):
                             hub_dir, publisher, name, model_dir, repo_info
                         )
                         if ingested:
-                            print(f"  Ingested {ingested} local file(s) into HF blob store")
+                            print(f"  Ingested {ingested} local file(s) into HF blob store", flush=True)
                     except Exception as e:
-                        print(f"  Could not ingest locally ({e}); falling back to full download")
-                print(f"  Downloading {repo_id} (skipping any blobs already cached)...")
+                        print(f"  Could not ingest locally ({e}); falling back to full download", flush=True)
+                print(f"  Downloading {repo_id} (skipping any blobs already cached)...", flush=True)
                 snapshot_path = Path(snapshot_download(repo_id=repo_id, cache_dir=str(hub_dir)))
             replace_with_symlink_tree(model_dir, snapshot_path)
-            print(f"  Mirrored {repo_id}")
+            print(f"\n  Mirrored {repo_id}", flush=True)
         except Exception as e:
-            print(f"  Failed to mirror {repo_id}: {e}")
+            print(f"\n  Failed to mirror {repo_id}: {e}", flush=True)
             continue
 
 def main():
