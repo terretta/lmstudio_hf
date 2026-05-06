@@ -724,39 +724,87 @@ def curate_entries(entries):
         modality_suffix = "" if modality == "text" else f" [{modality}]"
         label = f"{family}{modality_suffix}"
 
-        # Bucket by slot. Same slot = competing entries (newer version wins,
-        # others either superseded by version or redundant within version).
-        # Different slots = different niches (different size class, dense vs
-        # MoE, different alignment, different quant tier). Both can be kept.
-        by_slot = {}
+        # Initialize curation tags up front.
         for m in members:
-            slot = _slot_key(m)
             m["curation"] = {
                 "group": label,
-                "slot": slot,
+                "slot": _slot_key(m),
                 "decision": None,
                 "reason": None,
             }
-            by_slot.setdefault(slot, []).append(m)
+
+        # Identify the highest version present in this family group.
+        versions = [
+            v for v in (_version_float(m.get("enrichment") or {}) for m in members)
+            if v is not None
+        ]
+        v_max = max(versions) if versions else None
+
+        # Build the set of "feature signatures" present at V_max — what
+        # purposes, alignment statuses, and capabilities the latest family
+        # version actually covers. Each signature is (purpose, aligned_bool,
+        # frozenset(capabilities)).
+        vmax_feats = []
+        if v_max is not None:
+            for m in members:
+                v = _version_float(m.get("enrichment") or {})
+                if v == v_max:
+                    enr = m.get("enrichment") or {}
+                    vmax_feats.append((
+                        enr.get("purpose") or "instruct",
+                        bool(enr.get("alignment")),
+                        frozenset(enr.get("capabilities") or []),
+                    ))
+
+        # Pass 1 — feature-coverage supersession.
+        # An older-version entry is superseded by V_max iff some V_max entry
+        # has the same purpose, the same alignment status (vanilla vs aligned),
+        # and a capability set that's a superset of the older entry's. If V_max
+        # is missing any of those — different purpose, switching from aligned
+        # to vanilla, or losing a capability the older one had (e.g. older has
+        # vision-input but V_max only has text-only variants) — the older
+        # entry stays a keeper because the newer family lacks something key.
+        for m in members:
+            enr = m.get("enrichment") or {}
+            v = _version_float(enr)
+            if v_max is None or v is None or v >= v_max:
+                continue
+            older_feat = (
+                enr.get("purpose") or "instruct",
+                bool(enr.get("alignment")),
+                frozenset(enr.get("capabilities") or []),
+            )
+            covered_by = None
+            for vm_p, vm_a, vm_c in vmax_feats:
+                if vm_p == older_feat[0] and vm_a == older_feat[1] and older_feat[2].issubset(vm_c):
+                    covered_by = (vm_p, vm_a, vm_c)
+                    break
+            if covered_by is not None:
+                m["curation"]["decision"] = "supersede"
+                aligned_label = "aligned" if older_feat[1] else "vanilla"
+                caps_label = ("+".join(sorted(older_feat[2])) if older_feat[2] else "no extra caps")
+                m["curation"]["reason"] = (
+                    f"v{v:g} role ({older_feat[0]}, {aligned_label}, {caps_label}) "
+                    f"covered by v{v_max:g}"
+                )
+
+        # Pass 2 — slot-based keep/redundant among the un-superseded.
+        # Includes V_max members AND older entries whose features V_max
+        # didn't cover (those are keeper-eligible because they offer something
+        # the newer family lacks). Within a slot, newest-version-and-best
+        # wins; same-slot ties become redundant.
+        by_slot = {}
+        for m in members:
+            if m["curation"]["decision"] is not None:
+                continue
+            by_slot.setdefault(m["curation"]["slot"], []).append(m)
 
         for slot, slot_members in by_slot.items():
-            # Sort newest-first using the recommendation tuple.
             sorted_members = sorted(slot_members, key=_curation_sort_key)
-            top_version = None
-            for sm in sorted_members:
-                v = _version_float(sm.get("enrichment") or {})
-                if v is not None:
-                    top_version = v
-                    break
-
             kept = False
             for sm in sorted_members:
                 cur = sm["curation"]
-                v = _version_float(sm.get("enrichment") or {})
-                if top_version is not None and v is not None and v < top_version:
-                    cur["decision"] = "supersede"
-                    cur["reason"] = f"version {v:g} superseded in this slot by {top_version:g}"
-                elif not kept:
+                if not kept:
                     cur["decision"] = "keep"
                     cur["reason"] = "best in slot"
                     kept = True
@@ -942,6 +990,23 @@ _PURPOSE_TOKENS = (
     # instruct/chat are the default — handled implicitly when nothing else matches
 )
 _INSTRUCT_TOKENS = re.compile(r"\b(it|instruct|inst|chat)\b")
+
+# Specificity ranks for purpose detection. Used when reconciling HF-tag-derived
+# purpose against name-parsed purpose: take whichever is more specific. HF
+# inconsistently labels e.g. arthurcollet/Qwen3-Coder-Next as 'instruct' while
+# its name clearly says 'Coder' — defer to the more specific signal so the
+# model lands in the right purpose group for curation.
+_PURPOSE_SPECIFICITY = {
+    None:            0,
+    "instruct":      1,
+    "base":          1,
+    "coder":         2,
+    "reasoning":     2,
+    "embedding":     2,
+    "asr":           2,
+    "vision-output": 2,
+    "video-output":  2,
+}
 
 # Capabilities — additive. A model can have multiple. Inferred from HF tags
 # primarily; from name as fallback.
@@ -1790,7 +1855,15 @@ def _enrich_with_hub_metadata(sections):
         if meta.get("alignment"):
             enr["alignment"] = meta["alignment"]
         if meta.get("purpose"):
-            enr["purpose"] = meta["purpose"]
+            parsed_purpose = enr.get("purpose")
+            hf_purpose = meta["purpose"]
+            # Take the more specific of the two. Coder/reasoning/embedding/asr
+            # are more specific than HF's generic conversational "instruct"
+            # default, so a name-parsed "coder" wins over an HF "instruct".
+            parsed_rank = _PURPOSE_SPECIFICITY.get(parsed_purpose, 0)
+            hf_rank = _PURPOSE_SPECIFICITY.get(hf_purpose, 0)
+            if hf_rank >= parsed_rank:
+                enr["purpose"] = hf_purpose
         if meta.get("capabilities"):
             # Merge capabilities from HF on top of name-parsed; dedupe.
             existing = list(enr.get("capabilities") or [])
