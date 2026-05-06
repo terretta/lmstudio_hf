@@ -952,11 +952,31 @@ def discover():
         app_install_paths=["/Applications/Jan.app"],
     )
 
+    # Msty family — Msty, Msty Claw, and MstyStudio all use Ollama-format
+    # storage (manifests/registry.ollama.ai/ + blobs/sha256-*), so they share
+    # scan_ollama_models. Each is a separate app with its own data dir.
     add(
         "Msty",
-        [Path(os.path.expanduser("~/.msty/models"))],
-        lambda p: scan_flat_dir(p, "Msty"),
+        [
+            Path(os.path.expanduser("~/Library/Application Support/Msty/models")),
+            Path(os.path.expanduser("~/.msty/models")),
+        ],
+        scan_ollama_models,
         app_install_paths=["/Applications/Msty.app"],
+    )
+
+    add(
+        "Msty Claw",
+        [Path(os.path.expanduser("~/.mstyclaw/local-ai/models"))],
+        scan_ollama_models,
+        app_install_paths=["/Applications/Msty Claw.app"],
+    )
+
+    add(
+        "MstyStudio",
+        [Path(os.path.expanduser("~/Library/Application Support/MstyStudio/models"))],
+        scan_ollama_models,
+        app_install_paths=["/Applications/MstyStudio.app"],
     )
 
     add(
