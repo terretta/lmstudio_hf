@@ -596,6 +596,44 @@ def find_macos_container_for_bundle(bundle_id):
             return entry
     return None
 
+def find_comfyui_installs():
+    """Locate ComfyUI installs anywhere on disk, regardless of conventional path.
+
+    A ComfyUI install is identified by the characteristic shape: a directory
+    that contains both `models/` and `custom_nodes/` subdirectories. This
+    catches installs in iCloud Drive, external volumes, project workspaces,
+    or any other non-default location. Falls back to an empty list on
+    non-macOS or if mdfind isn't available.
+    """
+    if sys.platform != "darwin":
+        return []
+    if os.environ.get("LMSTUDIO_HF_NO_MDFIND"):
+        return []
+    try:
+        result = subprocess.run(
+            ["mdfind", 'kMDItemFSName == "custom_nodes" && kMDItemContentType == "public.folder"'],
+            capture_output=True, text=True, timeout=60,
+        )
+    except Exception:
+        return []
+    seen = set()
+    installs = []
+    for line in result.stdout.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        custom_nodes = Path(s)
+        if not custom_nodes.is_dir():
+            continue
+        parent = custom_nodes.parent
+        if parent in seen:
+            continue
+        if not (parent / "models").is_dir():
+            continue
+        seen.add(parent)
+        installs.append(parent)
+    return installs
+
 def scan_drawthings_models(model_dir):
     """Inventory Draw Things models. Each model is a <name>.ckpt, optionally
     paired with a <name>.ckpt-tensordata; size is the sum of both. Skip
@@ -1055,12 +1093,17 @@ def discover():
         app_install_paths=["/Applications/AnythingLLM.app"],
     )
 
+    comfyui_paths = [
+        Path(os.path.expanduser("~/ComfyUI/models")),
+        Path(os.path.expanduser("~/Documents/ComfyUI/models")),
+    ]
+    for install in find_comfyui_installs():
+        models = install / "models"
+        if models not in comfyui_paths:
+            comfyui_paths.append(models)
     add(
         "ComfyUI",
-        [
-            Path(os.path.expanduser("~/ComfyUI/models")),
-            Path(os.path.expanduser("~/Documents/ComfyUI/models")),
-        ],
+        comfyui_paths,
         lambda p: scan_flat_dir(p, "ComfyUI"),
     )
 
