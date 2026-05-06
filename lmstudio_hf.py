@@ -2151,19 +2151,44 @@ def format_curation_grid(sections, ad_hoc):
         members = by_purpose.get(purpose) or []
         if not members:
             continue
-        # Sort within a purpose group: family asc, then size class numeric
-        # (small to large reads naturally), then dense before MoE within
-        # the same size class, then exact size, then the recommendation
-        # tuple (newest version, vanilla before alignment, higher precision,
-        # mlx-runner first, more recently updated).
+        # Sort hierarchy within a purpose group (most significant first):
+        #   1. family             alphabetical, A → Z
+        #   2. version            newer → older
+        #   3. size class         large → small (xxl, xl, large, medium, small, tiny)
+        #   4. architecture       dense → MoE
+        #   5. exact size         large → small
+        #   6. alignment          vanilla → alignment-tagged
+        #   7. last-modified date newer → older
+        #   8. quant tier         high precision → low (fp → 8bit → 4bit → ...)
+        #   9. runner             mlx/mflux → gguf → transformers/diffusers
+        #  10. id                 alphabetical (deterministic tiebreak)
+        # Unknown size class (no parsed size) sorts LAST within a family.
         def _grid_key(pair):
             _app, e = pair
             enr = e.get("enrichment") or {}
             fam = (enr.get("family") or "~").lower()
+            version = _version_float(enr) or 0.0
+            sc_n = _size_class_numeric(enr.get("size") or "")
+            size_class_rank = 999 if sc_n == 99 else -sc_n  # large first; unknown last
+            arch_rank = 1 if enr.get("moe_active") else 0   # dense first
             size_n = _size_numeric(enr.get("size") or "") or 0.0
-            size_class_n = _size_class_numeric(enr.get("size") or "")
-            arch_rank = 1 if enr.get("moe_active") else 0  # dense first
-            return (fam, size_class_n, arch_rank, size_n) + _curation_sort_key(e)
+            has_alignment = 1 if enr.get("alignment") else 0
+            last_mod = _last_modified_days(enr)
+            quant_rank = _quant_tier_rank(_quant_tier(enr.get("quantization")))
+            runner_rank = _runner_rank(enr.get("runner"))
+            eid = e.get("id") or ""
+            return (
+                fam,
+                -version,
+                size_class_rank,
+                arch_rank,
+                -size_n,
+                has_alignment,
+                -last_mod,
+                quant_rank,
+                runner_rank,
+                eid,
+            )
         members.sort(key=_grid_key)
         n = len(members)
         total = sum(e["size"] for _, e in members)
