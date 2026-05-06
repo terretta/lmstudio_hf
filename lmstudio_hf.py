@@ -2312,7 +2312,7 @@ def _fetch_hub_chat_template_fp(repo_id, revision):
 def _hub_status_icon(enr):
     """Return a short icon describing this entry's local-vs-Hub state, or ' '.
 
-    ↥ (upgrade)         Hub has at least one LFS file with a sha256 our
+    ⇧ (upgrade)         Hub has at least one LFS file with a sha256 our
                         local cache doesn't have — the model file itself
                         was re-uploaded. Re-pull would replace bytes.
     ♢ (white diamond)   Commit changed AND the chat template specifically
@@ -2328,7 +2328,7 @@ def _hub_status_icon(enr):
     hub_lfs = enr.get("hub_lfs_shas")
     local_lfs = enr.get("local_lfs_shas")
     if hub_lfs and local_lfs is not None and not hub_lfs.issubset(local_lfs):
-        return "↥"
+        return "⇧"
     hub_sha = enr.get("hub_sha")
     local_sha = enr.get("local_sha")
     if hub_sha and local_sha and hub_sha != local_sha:
@@ -2515,7 +2515,7 @@ def format_curation_grid(sections, ad_hoc):
             out.append("  " + _format_grid_row_content(r, tool_codes))
     out.append("")
     out.append("Legend:  ● stored locally in this tool  ·  ✓ compatible (could be loaded if present)")
-    out.append("         Hub: ↥ Hub re-uploaded a model file (re-pull would replace bytes)  ·  ♢ chat template specifically changed  ·  ↻ Hub commit changed (likely metadata only)")
+    out.append("         Hub: ⇧ Hub re-uploaded a model file (re-pull would replace bytes)  ·  ♢ chat template specifically changed  ·  ↻ Hub commit changed (likely metadata only)")
     out.append("Tools:   " + " · ".join(f"{tc}={name}" for tc, name in _TOOL_COLUMNS))
     return "\n".join(out)
 
@@ -2587,7 +2587,7 @@ def mark_for_curation(grid_rows):
         print("\033[H\033[J", end="")
         print("Curation — mark for keep ✓ / delete ✕  (only ✕ deletes; defaults ●/○/· are no-ops)")
         print("  ↑/↓ navigate · SPACE cycle · Y keep · N delete · DEL unmark · ENTER confirm · Q or Ctrl+C cancel")
-        print("  Hub:  ↥ model file re-uploaded (re-pull would replace bytes)  ·  ♢ chat template specifically changed  ·  ↻ commit changed (likely metadata only)")
+        print("  Hub:  ⇧ model file re-uploaded (re-pull would replace bytes)  ·  ♢ chat template specifically changed  ·  ↻ commit changed (likely metadata only)")
 
         # Live counts at the top so user sees pending impact.
         n_delete = sum(1 for s in states if s == "delete")
