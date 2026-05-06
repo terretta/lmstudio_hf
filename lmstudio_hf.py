@@ -490,6 +490,21 @@ def _dir_size(path):
         pass
     return total
 
+def enrich_entry(entry, snapshot_path=None):
+    """Augment a discovered-item record with parsed metadata.
+
+    Mutates the entry in place by adding an `enrichment` field containing
+    fields from parse_model_id(entry['id']) plus, if a snapshot_path is
+    supplied and accessible, the chat_template fingerprint.
+    """
+    parsed = parse_model_id(entry.get("id") or "")
+    if snapshot_path is not None:
+        parsed["chat_template"] = chat_template_fingerprint(snapshot_path)
+    else:
+        parsed["chat_template"] = None
+    entry["enrichment"] = parsed
+    return entry
+
 def scan_hf_cache(hub_dir):
     """Yield records for each repo under a Hugging Face cache hub/ directory."""
     out = []
@@ -513,14 +528,16 @@ def scan_hf_cache(hub_dir):
             if ext in _MODEL_EXTENSIONS:
                 formats.add(ext.lstrip("."))
         fmt = "+".join(sorted(formats)) if formats else "other"
-        out.append({
+        rec = {
             "app": "Hugging Face cache",
             "id": f"{publisher}/{repo}",
             "path": snapshot,
             "format": fmt,
             "size": _dir_size(entry),
             "status": "canonical",
-        })
+        }
+        enrich_entry(rec, snapshot_path=snapshot)
+        out.append(rec)
     return out
 
 def _collect_hf_blob_hashes(hub_dir):
@@ -613,7 +630,7 @@ def scan_ollama_models(ollama_dir, app_name="Ollama", hf_blob_hashes=None):
         else:
             status = "ollama_blob"
 
-        out.append({
+        rec = {
             "app": app_name,
             "id": model_id,
             "path": blob,
@@ -621,8 +638,164 @@ def scan_ollama_models(ollama_dir, app_name="Ollama", hf_blob_hashes=None):
             "size": size,
             "status": status,
             "extra": {"registry": registry, "blob_sha256": blob_hex},
-        })
+        }
+        # Ollama-format blobs are nameless; no co-located tokenizer. Name
+        # parsing alone supplies what enrichment can.
+        enrich_entry(rec, snapshot_path=None)
+        out.append(rec)
     return out
+
+_KNOWN_FAMILIES = (
+    "gemma", "qwen", "llama", "mistral", "mixtral", "phi", "granite",
+    "deepseek", "yi", "nous", "hermes", "olmo", "tinyllama", "falcon",
+    "mpt", "stablelm", "codellama", "starcoder", "wizardlm", "qwq",
+    "minimax", "ltx", "flux", "z-image", "sdxl", "glm", "parakeet",
+    "moondream", "siglip", "clip", "t5",
+)
+_ALIGNMENT_TOKENS = (
+    "heretic", "abliterated", "uncensored", "decensored", "disinhibited",
+    "unrestricted", "neutered",
+)
+_VARIANT_TOKENS = (
+    ("vision", r"\b(vision|vl|visual)\b"),
+    ("coder",  r"\bcoder\b"),
+    ("thinking", r"\bthinking\b"),
+    ("instruct", r"\b(it|instruct|inst|chat)\b"),
+    ("base",   r"\bbase\b"),
+)
+_QUANT_PATTERNS = [
+    ("q4_k_m",     r"q4[_-]?k[_-]?m"),
+    ("q4_k_s",     r"q4[_-]?k[_-]?s"),
+    ("q5_k_m",     r"q5[_-]?k[_-]?m"),
+    ("q6_k",       r"q6[_-]?k"),
+    ("q8_0",       r"q8[_-]?0"),
+    ("iq3_m",      r"iq3[_-]?m"),
+    ("iq4",        r"iq4"),
+    ("mxfp8",      r"mxfp8"),
+    ("nvfp4",      r"nvfp4"),
+    ("bf16",       r"bf16"),
+    ("fp16",       r"fp16"),
+    ("fp8",        r"fp8"),
+    ("mixed-9bit", r"mixed[-_]?9[-_]?bit"),
+    ("mixed-8bit", r"mixed[-_]?8[-_]?bit"),
+    ("mixed-5bit", r"mixed[-_]?5[-_]?bit"),
+    ("mixed-4bit", r"mixed[-_]?4[-_]?bit"),
+    ("9bit",       r"\b9[-_]?bit\b"),
+    ("8bit",       r"\b8[-_]?bit\b"),
+    ("6bit",       r"\b6[-_]?bit\b"),
+    ("5bit",       r"\b5[-_]?bit\b"),
+    ("4bit",       r"\b4[-_]?bit\b"),
+    ("3bit",       r"\b3[-_]?bit\b"),
+    ("q8p",        r"q8p"),
+    ("q6p",        r"q6p"),
+]
+
+def parse_model_id(repo_id):
+    """Heuristically extract structured metadata from a publisher/name string.
+
+    Returns a dict with keys: publisher, name, family, version, size,
+    moe_active, variant, alignment, format, quantization, training. Any
+    field whose token isn't recognized in the input is left as None.
+    """
+    parts = repo_id.split("/")
+    publisher = parts[0] if len(parts) >= 2 else None
+    name = parts[-1]
+    s = name.lower()
+
+    out = {
+        "publisher":    publisher,
+        "name":         name,
+        "family":       None,
+        "version":      None,
+        "size":         None,
+        "moe_active":   None,
+        "variant":      None,
+        "alignment":    None,
+        "format":       None,
+        "quantization": None,
+        "training":     None,
+    }
+
+    fam_pat = "|".join(re.escape(f) for f in _KNOWN_FAMILIES)
+    # Allow ., -, _, or space between family and version (e.g. FLUX.2, Gemma-4,
+    # Qwen3, qwen 3.5).
+    m = re.search(rf"\b({fam_pat})[ \-_.]?(\d+(?:\.\d+)?)?", s)
+    if m:
+        out["family"] = m.group(1)
+        if m.group(2):
+            out["version"] = m.group(2)
+
+    m = re.search(r"(?:^|[\-_ /])(\d+(?:\.\d+)?)\s*[bB](?:[\-_ ./]|$)", repo_id)
+    if m:
+        out["size"] = f"{m.group(1)}B"
+
+    m = re.search(r"[-_]A(\d+(?:\.\d+)?)B(?:[\-_/]|$)", repo_id)
+    if m:
+        out["moe_active"] = f"A{m.group(1)}B"
+
+    if "mlx" in s:
+        out["format"] = "mlx"
+    elif "gguf" in s:
+        out["format"] = "gguf"
+    elif "safetensors" in s:
+        out["format"] = "safetensors"
+
+    for label, pat in _QUANT_PATTERNS:
+        if re.search(pat, s):
+            out["quantization"] = label
+            break
+
+    for label, pat in _VARIANT_TOKENS:
+        if re.search(pat, s):
+            out["variant"] = label
+            break
+
+    found_alignment = [kw for kw in _ALIGNMENT_TOKENS if kw in s]
+    if found_alignment:
+        out["alignment"] = "+".join(found_alignment)
+
+    if "qat" in s:
+        out["training"] = "qat"
+    elif "distilled" in s:
+        out["training"] = "distilled"
+    elif "dpo" in s:
+        out["training"] = "dpo"
+
+    return out
+
+def chat_template_fingerprint(snapshot_path):
+    """Return a short sha256 prefix of the tokenizer's chat_template, or None.
+
+    Two models with the same chat_template fingerprint share the same prompt
+    formatting (subject to whitespace exactness). Used to spot cases where a
+    family has multiple checkpoints but only some have the latest template
+    update (e.g. Heretic v2).
+    """
+    if snapshot_path is None or not snapshot_path.exists():
+        return None
+    candidates = [
+        snapshot_path / "tokenizer_config.json",
+        snapshot_path / "chat_template.jinja",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            text = path.read_text()
+        except OSError:
+            continue
+        template = None
+        if path.suffix == ".json":
+            try:
+                obj = json.loads(text)
+                template = obj.get("chat_template")
+            except Exception:
+                continue
+        else:
+            template = text
+        if template:
+            return hashlib.sha256(template.encode("utf-8")).hexdigest()[:8]
+    return None
 
 def find_macos_container_for_bundle(bundle_id):
     """Resolve a Mac App Store sandboxed app's on-disk container path.
@@ -724,14 +897,16 @@ def scan_drawthings_models(model_dir):
                 continue
         if total < _DISCOVER_MIN_BYTES:
             continue
-        out.append({
+        rec = {
             "app": "Draw Things",
             "id": basename,
             "path": path,
             "format": "ckpt",
             "size": total,
             "status": "proprietary",
-        })
+        }
+        enrich_entry(rec, snapshot_path=None)
+        out.append(rec)
     return out
 
 def scan_flat_dir(root, app_name, extensions=_MODEL_EXTENSIONS):
@@ -750,14 +925,18 @@ def scan_flat_dir(root, app_name, extensions=_MODEL_EXTENSIONS):
             continue
         if size < _DISCOVER_MIN_BYTES:
             continue
-        out.append({
+        rec = {
             "app": app_name,
             "id": path.name,
             "path": path,
             "format": path.suffix.lower().lstrip("."),
             "size": size,
             "status": "mirror_candidate",
-        })
+        }
+        # ComfyUI / Jan / GPT4All stash files in flat dirs without a
+        # co-located tokenizer config; only name parsing applies.
+        enrich_entry(rec, snapshot_path=None)
+        out.append(rec)
     return out
 
 def scan_mdfind():
@@ -935,7 +1114,48 @@ def _format_known_section(section):
         if tag and tag != "canonical":  # canonical is implicit; don't clutter
             line += f"   [{tag}]"
         out.append(line)
+        enrichment_line = _format_enrichment_line(i.get("enrichment"))
+        if enrichment_line:
+            out.append(f"      {enrichment_line}")
     return out
+
+def _format_enrichment_line(enrichment):
+    """Render the parsed metadata as a compact one-liner, or None if empty."""
+    if not enrichment:
+        return None
+    parts = []
+    fam = enrichment.get("family")
+    ver = enrichment.get("version")
+    if fam:
+        parts.append(fam + (f" {ver}" if ver else ""))
+    sz = enrichment.get("size")
+    moe = enrichment.get("moe_active")
+    if sz or moe:
+        size_part = sz or ""
+        if moe:
+            size_part = f"{size_part} {moe}".strip()
+        parts.append(size_part)
+    flavor_bits = []
+    if enrichment.get("variant"):
+        flavor_bits.append(enrichment["variant"])
+    if enrichment.get("alignment"):
+        flavor_bits.append(enrichment["alignment"])
+    if enrichment.get("training"):
+        flavor_bits.append(enrichment["training"])
+    if flavor_bits:
+        parts.append(" ".join(flavor_bits))
+    fmt_q = []
+    if enrichment.get("format"):
+        fmt_q.append(enrichment["format"])
+    if enrichment.get("quantization"):
+        fmt_q.append(enrichment["quantization"])
+    if fmt_q:
+        parts.append(" ".join(fmt_q))
+    if enrichment.get("chat_template"):
+        parts.append(f"ct:{enrichment['chat_template'][:8]}")
+    if not parts:
+        return None
+    return " · ".join(parts)
 
 def _format_ad_hoc_section(ad_hoc, mdfind_total, already_known, mdfind_note):
     """Render the 'Outside known caches' section."""
@@ -1092,7 +1312,7 @@ def discover():
 
     def _lms_record(pub, name, model_dir, fmt):
         symlinked = is_already_symlinked(model_dir)
-        return {
+        rec = {
             "app": "LM Studio",
             "id": f"{pub}/{name}",
             "path": model_dir,
@@ -1101,6 +1321,12 @@ def discover():
             "extra": {"symlinked": symlinked},
             "status": "canonical" if symlinked else "mirror_candidate",
         }
+        # When LM Studio entries are symlinked into HF cache, the actual
+        # tokenizer config and chat_template live in the snapshot they point
+        # at; pass the snapshot path so chat_template_fingerprint succeeds.
+        snap = resolve_hf_snapshot(hub_dir, pub, name)
+        enrich_entry(rec, snapshot_path=snap or model_dir)
+        return rec
 
     add(
         "LM Studio",
