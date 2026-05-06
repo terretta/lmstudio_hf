@@ -525,19 +525,48 @@ def _quant_tier(quant):
         return None
     return _QUANT_TIER.get(quant, "other")
 
-def _family_group_key(entry):
-    """Hashable group key for curation: (family, size, moe_active).
+def _modality_class(pipeline_tag):
+    """Coarsen a pipeline_tag into one of {text, image, video, audio}.
 
-    Variants like instruct vs base, and different alignment tags, share a
-    group — that's the point. Different parameter sizes (4B vs 26B) and MoE
-    activation patterns (A4B vs A10B) are distinct groups, since those are
-    structurally different models.
+    Classifies by *output* modality, not input. HF tags 'image-text-to-text'
+    is a vision-LLM (image input, text output) — it belongs with text-LLMs
+    for curation, not with image-generation models like FLUX. The split
+    point is the last '-to-' in the tag:
+
+      text-generation          → text
+      image-text-to-text       → text  (multimodal input, text out)
+      text-to-image            → image
+      image-to-image           → image
+      text-to-video            → video
+      automatic-speech-recognition → audio (domain-based fallback)
+    """
+    if not pipeline_tag:
+        return "text"
+    pt = pipeline_tag.lower()
+    output = pt.rsplit("-to-", 1)[1] if "-to-" in pt else pt
+    if output.startswith("image"):
+        return "image"
+    if output.startswith("video"):
+        return "video"
+    if "speech" in pt or "audio" in pt:
+        return "audio"
+    return "text"
+
+def _family_group_key(entry):
+    """Hashable group key for curation: (family, size, moe_active, modality).
+
+    Same family + same parameter scale + same modality lands together
+    regardless of publisher, format, or quantization. Different sizes
+    (4B vs 26B) and MoE activation patterns (A4B vs A10B) stay distinct.
+    Modality (text vs image vs video) splits e.g. Qwen-Image-Edit from
+    Qwen3-Coder when both parse as family='qwen' with no size.
     """
     enr = (entry.get("enrichment") or {})
     family = enr.get("family")
     if not family:
         return None  # un-curatable; no family parsed
-    return (family, enr.get("size") or "", enr.get("moe_active") or "")
+    modality = _modality_class(enr.get("pipeline_tag"))
+    return (family, enr.get("size") or "", enr.get("moe_active") or "", modality)
 
 def _version_float(enr):
     if not enr:
@@ -619,8 +648,13 @@ def curate_entries(entries):
             continue
         by_group.setdefault(key, []).append(e)
 
-    for (family, size, moe), members in by_group.items():
+    for key, members in by_group.items():
+        family, size, moe, modality = key
+        # Suffix non-text modality so the group label distinguishes
+        # text-LLM vs image/video pipelines that share family/size.
+        modality_suffix = "" if modality == "text" else f" [{modality}]"
         label = " ".join(p for p in (family, size, moe) if p) or family
+        label = f"{label}{modality_suffix}"
         # Highest version present in this group (or 0 if none have versions).
         versions = [v for v in (_version_float(m.get("enrichment") or {}) for m in members) if v is not None]
         top_version = max(versions) if versions else None
@@ -655,7 +689,7 @@ def curate_entries(entries):
 
     # Second pass per group: assign keep / redundant within top-version slots.
     # The _curation_slot_seen scratchpad above wasn't ideal; redo cleanly here.
-    for (family, size, moe), members in by_group.items():
+    for _key, members in by_group.items():
         sorted_members = sorted(members, key=_curation_sort_key)
         slot_taken = set()
         for m in sorted_members:
@@ -1470,14 +1504,27 @@ def format_discovery_report(sections, ad_hoc, mdfind_total, already_known, mdfin
     return "\n".join(lines)
 
 def _enrich_with_hub_metadata(sections):
-    """Augment HF-derived items with last_modified and license from the Hub.
+    """Augment HF-derived items with authoritative metadata from the Hub.
 
-    Adds enrichment["last_modified"] (ISO-format date string) and
-    enrichment["license"] for entries whose id is a real HF repo_id. Caches
-    by repo_id so multiple entries pointing at the same repo (e.g. an HF
-    cache record AND a symlinked LM Studio record) only cost one API call.
-    Failures per repo are silent — the field stays None and the rest of
-    discover keeps working.
+    Extracts and applies, for each HF-resolved repo:
+      library_name      Authoritative format (mlx, transformers, gguf).
+                        Overrides the heuristic name-parsed format.
+      pipeline_tag      e.g. "text-generation", "image-text-to-text".
+                        Used to split text-LLM groups from image-gen
+                        groups in curation when name-parsing has no
+                        size signal to differentiate them.
+      tags              Full tag list. Searched for alignment tokens
+                        (heretic / abliterated / uncensored / decensored
+                        / disinhibited / unrestricted / neutered) and
+                        for an architecture identifier (qwen3_5_moe,
+                        gemma3, granite, etc.).
+      base_model        Upstream lineage from card_data.base_model.
+      license           From card_data.license.
+      last_modified     ISO date string of latest commit.
+
+    All HF-sourced fields take precedence over the heuristic name-parsed
+    fields when set. Cached per repo_id so repeated lookups of the same
+    repo (e.g. HF cache + symlinked LM Studio) cost one API call.
     """
     try:
         from huggingface_hub import HfApi
@@ -1492,25 +1539,64 @@ def _enrich_with_hub_metadata(sections):
     api = HfApi()
     cache = {}
 
+    def _detect_alignment_from_tags(tags):
+        hits = sorted(set(t for t in tags if t in _ALIGNMENT_TOKENS))
+        return "+".join(hits) if hits else None
+
+    def _detect_architecture_from_tags(tags):
+        # HF tags often include the model_type (e.g. "qwen3_5_moe", "gemma3",
+        # "granite"). Pick the first tag that looks like an architecture
+        # identifier — alphabetic + optional digits, possibly with underscore
+        # separators, no spaces or punctuation.
+        for t in tags:
+            if not isinstance(t, str):
+                continue
+            # Skip namespaced tags ("base_model:...", "license:...", "region:us")
+            if ":" in t:
+                continue
+            if re.fullmatch(r"[a-z][a-z0-9_]*\d[a-z0-9_]*", t) or re.fullmatch(r"[a-z]+\d+[a-z_]*", t):
+                # avoid plain quant tags like "6-bit" (has hyphen) or "8B"
+                if t.endswith("bit") or re.fullmatch(r"\d+b", t):
+                    continue
+                return t
+        return None
+
     def lookup(repo_id):
         if repo_id in cache:
             return cache[repo_id]
+        result = {
+            "last_modified": None, "license": None,
+            "library_name": None, "pipeline_tag": None,
+            "tags": [], "alignment": None,
+            "base_model": None, "model_type": None,
+        }
         try:
             info = api.model_info(repo_id)
-            last_modified = None
-            if getattr(info, "last_modified", None):
-                last_modified = info.last_modified.date().isoformat()
-            license_ = None
-            cd = getattr(info, "card_data", None)
-            if cd is not None:
-                cd_dict = cd.to_dict() if hasattr(cd, "to_dict") else dict(cd)
-                license_ = cd_dict.get("license")
-            cache[repo_id] = {"last_modified": last_modified, "license": license_}
         except (RepositoryNotFoundError, GatedRepoError):
-            cache[repo_id] = {"last_modified": None, "license": None}
+            cache[repo_id] = result
+            return result
         except Exception:
-            cache[repo_id] = {"last_modified": None, "license": None}
-        return cache[repo_id]
+            cache[repo_id] = result
+            return result
+        if getattr(info, "last_modified", None):
+            result["last_modified"] = info.last_modified.date().isoformat()
+        result["library_name"] = getattr(info, "library_name", None)
+        result["pipeline_tag"] = getattr(info, "pipeline_tag", None)
+        tags = list(getattr(info, "tags", []) or [])
+        result["tags"] = tags
+        result["alignment"] = _detect_alignment_from_tags(tags)
+        result["model_type"] = _detect_architecture_from_tags(tags)
+        cd = getattr(info, "card_data", None)
+        if cd is not None:
+            cd_dict = cd.to_dict() if hasattr(cd, "to_dict") else dict(cd)
+            result["license"] = cd_dict.get("license")
+            bm = cd_dict.get("base_model")
+            if isinstance(bm, list) and bm:
+                result["base_model"] = bm[0]
+            elif isinstance(bm, str):
+                result["base_model"] = bm
+        cache[repo_id] = result
+        return result
 
     targets = []  # (item, repo_id) pairs
     for s in sections:
@@ -1538,8 +1624,18 @@ def _enrich_with_hub_metadata(sections):
     for item, repo_id in targets:
         meta = lookup(repo_id)
         enr = item.setdefault("enrichment", {})
+        # Always set even when None; downstream uses these as authoritative.
         enr["last_modified"] = meta["last_modified"]
         enr["license"] = meta["license"]
+        enr["pipeline_tag"] = meta["pipeline_tag"]
+        enr["base_model"] = meta["base_model"]
+        enr["model_type"] = meta["model_type"]
+        # Authoritative overrides — only when HF actually returned a value;
+        # otherwise leave the heuristic-parsed field in place as fallback.
+        if meta.get("library_name"):
+            enr["format"] = meta["library_name"]
+        if meta.get("alignment"):
+            enr["alignment"] = meta["alignment"]
 
 _DECISION_TAG = {
     "keep":      "keep",
@@ -1621,6 +1717,7 @@ def format_curation_view(sections, ad_hoc):
             if enr.get("quantization"): meta_bits.append(enr["quantization"])
             if enr.get("chat_template"): meta_bits.append(f"ct:{enr['chat_template'][:8]}")
             if enr.get("last_modified"): meta_bits.append(f"upd:{enr['last_modified']}")
+            if enr.get("base_model"): meta_bits.append(f"from {enr['base_model']}")
             meta = " · ".join(meta_bits) if meta_bits else ""
             tag = f"[{decision_tag}]"
             out.append(f"  {tag:<14} {app:<14} {id_str}")
@@ -1949,7 +2046,13 @@ def main():
         types = {"mlx", "gguf"} if args.type == "both" else {args.type}
         mirror_to_huggingface(types, reuse_local=not args.no_reuse)
     elif args.cmd == "discover":
-        discover(hub_meta=args.hub_meta, curate=args.curate)
+        # --curate implies --hub-meta: curation needs HF's authoritative
+        # library_name / tags / pipeline_tag / base_model to make accurate
+        # decisions instead of reverse-engineering them from repo names.
+        discover(
+            hub_meta=args.hub_meta or args.curate,
+            curate=args.curate,
+        )
     else:
         manage_models()
 
