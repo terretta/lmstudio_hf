@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import plistlib
 import re
 import subprocess
 import sys
@@ -561,6 +562,77 @@ def scan_ollama_models(ollama_dir):
         })
     return out
 
+def find_macos_container_for_bundle(bundle_id):
+    """Resolve a Mac App Store sandboxed app's on-disk container path.
+
+    Older Mac App Store apps created their container at
+    ~/Library/Containers/<bundle-id>/. Newer ones use a randomly-assigned UUID
+    for the container directory and store the bundle-id mapping in the
+    container's `.com.apple.containermanagerd.metadata.plist` under
+    MCMMetadataIdentifier. Walk both shapes and return whichever matches.
+    """
+    if sys.platform != "darwin":
+        return None
+    containers_root = Path.home() / "Library" / "Containers"
+    if not containers_root.exists():
+        return None
+    direct = containers_root / bundle_id
+    if direct.exists():
+        return direct
+    for entry in containers_root.iterdir():
+        if not entry.is_dir():
+            continue
+        meta = entry / ".com.apple.containermanagerd.metadata.plist"
+        if not meta.exists():
+            continue
+        try:
+            with open(meta, "rb") as f:
+                plist = plistlib.load(f)
+        except Exception:
+            continue
+        if plist.get("MCMMetadataIdentifier") == bundle_id:
+            return entry
+    return None
+
+def scan_drawthings_models(model_dir):
+    """Inventory Draw Things models. Each model is a <name>.ckpt, optionally
+    paired with a <name>.ckpt-tensordata; size is the sum of both. Skip
+    in-flight downloads (.ckpt.partial / .ckpt.partial.map) and metadata json.
+    """
+    out = []
+    if not model_dir.exists() or not model_dir.is_dir():
+        return out
+    seen = set()
+    for path in sorted(model_dir.iterdir()):
+        if not path.is_file() or path.name.startswith("."):
+            continue
+        if path.suffix != ".ckpt":
+            continue
+        if path.name.endswith(".partial") or path.name.endswith(".partial.map"):
+            continue
+        basename = path.stem
+        if basename in seen:
+            continue
+        seen.add(basename)
+        total = 0
+        for sibling_name in (f"{basename}.ckpt", f"{basename}.ckpt-tensordata"):
+            sibling = model_dir / sibling_name
+            try:
+                if sibling.exists() and sibling.is_file():
+                    total += sibling.stat().st_size
+            except OSError:
+                continue
+        if total < _DISCOVER_MIN_BYTES:
+            continue
+        out.append({
+            "app": "Draw Things",
+            "id": basename,
+            "path": path,
+            "format": "ckpt",
+            "size": total,
+        })
+    return out
+
 def scan_flat_dir(root, app_name, extensions=_MODEL_EXTENSIONS):
     """Recursively list HF-compatible model files under root, with size filter."""
     out = []
@@ -906,11 +978,20 @@ def discover():
         lambda p: scan_flat_dir(p, "ComfyUI"),
     )
 
+    draw_things_paths = []
+    for candidate in (
+        Path(os.path.expanduser("~/Library/Containers/com.liuliu.draw-things/Data/Documents/Models")),
+    ):
+        draw_things_paths.append(candidate)
+    container = find_macos_container_for_bundle("com.liuliu.draw-things")
+    if container is not None:
+        resolved = container / "Data" / "Documents" / "Models"
+        if resolved not in draw_things_paths:
+            draw_things_paths.append(resolved)
     add(
         "Draw Things",
-        [Path(os.path.expanduser(
-            "~/Library/Containers/com.liuliu.draw-things/Data/Documents/Models"))],
-        lambda p: scan_flat_dir(p, "Draw Things"),
+        draw_things_paths,
+        scan_drawthings_models,
         app_install_paths=["/Applications/Draw Things.app"],
     )
 
