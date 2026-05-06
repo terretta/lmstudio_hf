@@ -541,17 +541,23 @@ def _size_numeric(size_str):
     except ValueError:
         return None
 
-# Size buckets aligned with how people actually talk about model scale —
-# "the 8B class", "the 30B class". Boundaries chosen so each bucket
-# captures a typical model line cluster. Used for slot-grouping (keeper
-# determination) and for in-family sort within the curation grid.
+# Size buckets aligned with how people actually talk about model scale.
+# Boundaries chosen at the gaps between natural clusters in the LLM
+# ecosystem rather than at round-number bins, so that "the 4B class" is
+# distinct from "the 8B class" and "the 30B class" doesn't share a bucket
+# with "the 35-40B class" (different deployment niches, different inference
+# cost). Used for slot-grouping (keeper determination), feature-coverage
+# supersession, and in-family sort within the curation grid.
 _SIZE_CLASS_BUCKETS = [
-    ("tiny",   0,    4),     # < 4B (sub-clip / encoder-scale)
-    ("small",  4,    10),    # 4-10B (Llama-7B, Gemma-7B/8B, Mistral-7B)
-    ("medium", 10,   20),    # 10-20B (Gemma-12B, Llama-13B)
-    ("large",  20,   50),    # 20-50B (Gemma-26B/31B, Qwen-27B/35B)
-    ("xl",     50,   100),   # 50-100B (Llama-70B class)
-    ("xxl",    100,  9999),  # 100B+ (Qwen-122B, MiniMax)
+    ("tiny",   0,    3),     # 0-3B   (0.5B, 1B, 2B — TinyLlama, Phi-3.5 mini, Gemma 2B)
+    ("xs",     3,    7),     # 3-7B   (3B, 4B class — Gemma 4B, Phi-4, Llama 3.2 3B)
+    ("small",  7,    12),    # 7-12B  (8B class — Llama 8B, Gemma 9B, Granite 8B)
+    ("medium", 12,   16),    # 12-16B (12-14B class — Gemma 12B, Mistral Nemo 12B)
+    ("large",  16,   32),    # 16-32B (22-30B class — Gemma 27B, Qwen 27B, Granite 30B)
+    ("xl",     32,   52),    # 32-52B (32-40B class — Qwen 32B/35B, Yi 34B)
+    ("xxl",    52,   92),    # 52-92B (70B class — Llama 70B, Qwen 72B)
+    ("huge",   92,   150),   # 92-150B (100-130B class — Qwen 122B, MiniMax-M2.7)
+    ("mega",   150,  9999),  # 150B+  (200B+, 405B, 671B — DeepSeek-V3, Llama 405B)
 ]
 
 def _size_class_label(size_str):
@@ -620,9 +626,21 @@ def _family_group_key(entry):
 
 def _slot_key(entry):
     """Slot identity within a family group. Two entries with the same slot
-    key compete: newer version wins, others are superseded. Different slots
-    don't compete — gemma 4 26B-A4B (large MoE) and gemma 4 31B (large dense)
-    are distinct slots so both can be keepers.
+    key compete for one keeper; different slots are independent niches.
+
+    Components:
+      purpose      instruct / coder / reasoning / embedding / asr / ...
+      size_class   tiny / xs / small / medium / large / xl / xxl / huge / mega
+      arch         dense / moe
+      alignment    vanilla / aligned (binary; specific tags don't subdivide)
+      quant_tier   fp / 8bit / 6bit / 5bit / 4bit / 3bit / other
+      caps         additive capabilities (vision-input / tool-calling / ...)
+
+    Capabilities matter because a vision-LLM and a text-only of the same
+    family/version/size/arch fill different niches — both should be
+    keepers. Without caps in the slot, e.g. Qwen 3.5 REAP-97B (no vision)
+    would falsely collide with Qwen 3.5 122B-A10B nvfp4 (vision-input)
+    even though they're different models.
     """
     enr = entry.get("enrichment") or {}
     purpose = enr.get("purpose") or "instruct"
@@ -630,7 +648,8 @@ def _slot_key(entry):
     arch = "moe" if enr.get("moe_active") else "dense"
     alignment = enr.get("alignment") or "vanilla"
     tier = _quant_tier(enr.get("quantization")) or "other"
-    return f"{purpose}/{size_class}/{arch}/{alignment}/{tier}"
+    caps = "+".join(sorted(enr.get("capabilities") or [])) or "none"
+    return f"{purpose}/{size_class}/{arch}/{alignment}/{tier}/{caps}"
 
 def _version_float(enr):
     if not enr:
