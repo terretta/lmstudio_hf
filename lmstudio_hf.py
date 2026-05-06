@@ -62,7 +62,17 @@ def select_models(model_choices):
     return [choice for choice, is_selected in zip(model_choices, selected) if is_selected]
 
 def get_key():
-    """Get a single keypress from the user."""
+    """Get a single keypress from the user.
+
+    Handles single-byte keys plus the common ANSI escape sequences:
+      \\x1b[A/B/C/D     arrow keys (3 bytes)
+      \\x1b[3~          Delete / Forward Delete (4 bytes)
+      \\x1b[5~/[6~      PageUp / PageDown (4 bytes)
+      \\x1b[H / [F      Home / End (3 bytes)
+
+    Generic rule: after ESC + '[', if the third byte is a digit, keep
+    reading until we hit a non-digit terminator (~, A-Z).
+    """
     import tty, termios
 
     fd = sys.stdin.fileno()
@@ -72,6 +82,13 @@ def get_key():
         ch = sys.stdin.read(1)
         if ch == "\x1b":
             ch += sys.stdin.read(2)
+            # If the sequence is ESC [ <digit>, keep reading until terminator.
+            if len(ch) == 3 and ch[-1].isdigit():
+                while True:
+                    nxt = sys.stdin.read(1)
+                    ch += nxt
+                    if not nxt.isdigit():
+                        break
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
     return ch
@@ -2102,31 +2119,60 @@ def _identity_string(enr):
         parts.append("+".join(enr["capabilities"]))
     return " ".join(parts) if parts else "(unknown)"
 
-def format_curation_grid(sections, ad_hoc):
-    """Render a per-purpose grid of every model in the inventory.
+# Column widths for the curation grid + interactive picker. Chosen so the
+# grid fits in ~150 cols; values that would overflow are explicitly
+# truncated at render time so subsequent columns stay aligned.
+_GRID_W_ID, _GRID_W_RUN, _GRID_W_QUANT, _GRID_W_SIZE, _GRID_W_UPD, _GRID_W_CT, _GRID_W_DEC, _GRID_W_FROM = (
+    46, 12, 11, 8, 11, 8, 10, 32
+)
 
-    Rows are grouped by enrichment.purpose. Within each group, rows are
-    sorted recommended-first via _curation_sort_key. Each row shows
-    identity + key metadata + a small grid of tool-compat marks:
-
-      ●  this tool currently has the bytes locally
-      ✓  this tool can natively load this runner, but the bytes aren't
-         in its local store on this machine
-      ' ' this tool isn't compatible with this runner
-
-    Two passes:
-
-      1. Collect every entry that survives our curation filter (proprietary
-         entries are kept here so the user sees them; ollama_blob entries
-         are kept; LM Studio symlinked-into-HF entries are merged into the
-         HF cache row by aggregating their tool marks instead of dropping
-         the entry outright).
-      2. For each kept HF cache entry, look up the LM Studio entries with
-         matching id; if any are symlinked, the row's "LM" cell upgrades
-         from ✓ to ●.
+def _grid_sort_key_for_pair(pair):
+    """Sort hierarchy within a purpose group, most-significant first:
+       1. family            A → Z
+       2. version           newer → older
+       3. size class        large → small (unknown last)
+       4. architecture      dense → MoE
+       5. exact size        large → small
+       6. alignment         vanilla → alignment-tagged
+       7. last-modified     newer → older
+       8. quant tier        high precision → low
+       9. runner            mlx/mflux → gguf → transformers/diffusers
+      10. id                alphabetical
     """
-    # Build a quick lookup: id -> {app names that hold a copy} so we can
-    # merge HF cache + LM Studio symlinked etc. without dropping entries.
+    _app, e = pair
+    enr = e.get("enrichment") or {}
+    fam = (enr.get("family") or "~").lower()
+    version = _version_float(enr) or 0.0
+    sc_n = _size_class_numeric(enr.get("size") or "")
+    size_class_rank = 999 if sc_n == 99 else -sc_n
+    arch_rank = 1 if enr.get("moe_active") else 0
+    size_n = _size_numeric(enr.get("size") or "") or 0.0
+    has_alignment = 1 if enr.get("alignment") else 0
+    last_mod = _last_modified_days(enr)
+    quant_rank = _quant_tier_rank(_quant_tier(enr.get("quantization")))
+    runner_rank = _runner_rank(enr.get("runner"))
+    eid = e.get("id") or ""
+    return (
+        fam, -version, size_class_rank, arch_rank, -size_n,
+        has_alignment, -last_mod, quant_rank, runner_rank, eid,
+    )
+
+def compute_curation_grid_data(sections, ad_hoc):
+    """Build a structured row list for the curation grid.
+
+    Returns a flat list of dicts, each either:
+      {"kind": "header", "purpose": str, "n": int, "size": int,
+       "keepers": int, "prunes": int}
+      {"kind": "entry", "app": str, "entry": dict,
+       "stored_tools": set[str], "compat_tools": set[str]}
+
+    Both the static text renderer (format_curation_grid) and the
+    interactive picker (mark_for_curation) consume this list, so a single
+    code path determines which entries appear, in what order, with what
+    metadata.
+    """
+    # id -> set of app names that hold a copy. Used to merge symlinked
+    # LM Studio entries into their HF cache twin.
     id_to_apps = {}
     for s in sections:
         if s["status"] != "scanned":
@@ -2136,8 +2182,6 @@ def format_curation_grid(sections, ad_hoc):
             if eid:
                 id_to_apps.setdefault(eid, set()).add(s["app"])
 
-    # Collect entries for the grid. Skip LM Studio symlinked entries —
-    # they're a view of an HF cache entry that we'll mark via id_to_apps.
     grid_entries = []
     for s in sections:
         if s["status"] != "scanned":
@@ -2150,105 +2194,31 @@ def format_curation_grid(sections, ad_hoc):
         if (a.get("enrichment") or {}).get("family"):
             grid_entries.append(("(ad-hoc)", a))
 
-    # Apply curation tags to every kept entry.
     curate_entries([e for _app, e in grid_entries])
 
-    # Bucket by purpose. Entries with no detectable purpose go into "other"
-    # rather than silently defaulting to instruct — Draw Things' proprietary
-    # vision/encoder/VAE components, embedding-only models without HF tags,
-    # and similar all land here for honest inspection.
     by_purpose = {}
     for app, e in grid_entries:
         purpose = (e.get("enrichment") or {}).get("purpose") or "other"
         by_purpose.setdefault(purpose, []).append((app, e))
 
-    out = ["", "=" * 132, "Curation grid — by purpose, recommended first per group", "=" * 132]
-
-    tool_codes = [tc for tc, _ in _TOOL_COLUMNS]
-    tool_header = " ".join(f"{tc:^2}" for tc in tool_codes)
-
     purposes = list(_PURPOSE_DISPLAY_ORDER) + sorted(p for p in by_purpose if p not in _PURPOSE_DISPLAY_ORDER)
 
-    # Column widths — chosen so the grid fits in ~150 cols. Values that
-    # would overflow are explicitly truncated below; subsequent columns
-    # therefore stay aligned regardless of input length.
-    # Width of the Size column. _human_size produces strings like "116.2 GB"
-    # or "522.6 MB" that are 8 chars when the integer part is three digits;
-    # 7 isn't enough and overflows shift every subsequent column right.
-    W_ID, W_RUN, W_QUANT, W_SIZE, W_UPD, W_CT, W_DEC, W_FROM = 46, 12, 11, 8, 11, 8, 10, 32
-
+    rows = []
     for purpose in purposes:
         members = by_purpose.get(purpose) or []
         if not members:
             continue
-        # Sort hierarchy within a purpose group (most significant first):
-        #   1. family             alphabetical, A → Z
-        #   2. version            newer → older
-        #   3. size class         large → small (xxl, xl, large, medium, small, tiny)
-        #   4. architecture       dense → MoE
-        #   5. exact size         large → small
-        #   6. alignment          vanilla → alignment-tagged
-        #   7. last-modified date newer → older
-        #   8. quant tier         high precision → low (fp → 8bit → 4bit → ...)
-        #   9. runner             mlx/mflux → gguf → transformers/diffusers
-        #  10. id                 alphabetical (deterministic tiebreak)
-        # Unknown size class (no parsed size) sorts LAST within a family.
-        def _grid_key(pair):
-            _app, e = pair
-            enr = e.get("enrichment") or {}
-            fam = (enr.get("family") or "~").lower()
-            version = _version_float(enr) or 0.0
-            sc_n = _size_class_numeric(enr.get("size") or "")
-            size_class_rank = 999 if sc_n == 99 else -sc_n  # large first; unknown last
-            arch_rank = 1 if enr.get("moe_active") else 0   # dense first
-            size_n = _size_numeric(enr.get("size") or "") or 0.0
-            has_alignment = 1 if enr.get("alignment") else 0
-            last_mod = _last_modified_days(enr)
-            quant_rank = _quant_tier_rank(_quant_tier(enr.get("quantization")))
-            runner_rank = _runner_rank(enr.get("runner"))
-            eid = e.get("id") or ""
-            return (
-                fam,
-                -version,
-                size_class_rank,
-                arch_rank,
-                -size_n,
-                has_alignment,
-                -last_mod,
-                quant_rank,
-                runner_rank,
-                eid,
-            )
-        members.sort(key=_grid_key)
+        members.sort(key=_grid_sort_key_for_pair)
         n = len(members)
         total = sum(e["size"] for _, e in members)
         keepers = sum(1 for _, e in members if (e.get("curation") or {}).get("decision") == "keep")
-        prunes = sum(1 for _, e in members if (e.get("curation") or {}).get("decision") in ("supersede", "redundant"))
-
-        out.append("")
-        out.append(f"[{purpose.upper()}] · {n} entries · {_human_size(total)} · {keepers} keep · {prunes} prune")
-        out.append(
-            f"  {'Identity':<{W_ID}} {'Runner':<{W_RUN}} {'Quant':<{W_QUANT}} {'Size':>{W_SIZE}} "
-            f"{'Updated':<{W_UPD}} {'CT':<{W_CT}} {tool_header}  {'Decision':<{W_DEC}} From"
-        )
-        out.append("  " + "─" * 150)
-
+        prunes = sum(1 for _, e in members
+                     if (e.get("curation") or {}).get("decision") in ("supersede", "redundant"))
+        rows.append({
+            "kind": "header", "purpose": purpose, "n": n, "size": total,
+            "keepers": keepers, "prunes": prunes,
+        })
         for app, e in members:
-            enr = e.get("enrichment") or {}
-            cur = e.get("curation") or {}
-            ident = _identity_string(enr)[:W_ID]
-            runner = (enr.get("runner") or "")[:W_RUN]
-            quant = (enr.get("quantization") or "—")[:W_QUANT]
-            size_h = _human_size(e.get("size") or 0)
-            updated = (enr.get("last_modified") or "")[:W_UPD]
-            ct = enr.get("chat_template")
-            ct_short = (ct[:8] if ct else "")
-            decision = (cur.get("decision") or "—")[:W_DEC]
-            bm = enr.get("base_model") or ""
-            if len(bm) > W_FROM:
-                bm = bm[:W_FROM - 1] + "…"
-
-            # Determine tool marks for this row.
             stored_tools = set()
             for app_name in id_to_apps.get(e.get("id") or "", set()):
                 tc = _APP_TO_TOOL.get(app_name)
@@ -2257,32 +2227,242 @@ def format_curation_grid(sections, ad_hoc):
             tc_for_app = _APP_TO_TOOL.get(app)
             if tc_for_app:
                 stored_tools.add(tc_for_app)
+            enr = e.get("enrichment") or {}
             compat_tools = set(_RUNNER_COMPAT.get(enr.get("runner"), set()))
+            rows.append({
+                "kind": "entry", "app": app, "entry": e,
+                "stored_tools": stored_tools, "compat_tools": compat_tools,
+            })
+    return rows
 
-            row_tool_cells = []
-            for tc in tool_codes:
-                if tc in stored_tools:
-                    cell = "●"
-                elif tc in compat_tools:
-                    cell = "✓"
-                else:
-                    cell = " "
-                row_tool_cells.append(f"{cell:^2}")
-            tool_marks = " ".join(row_tool_cells)
+def _format_grid_row_content(row, tool_codes):
+    """Render the per-row content (without leading marker/cursor) shared
+    between the static grid and the interactive picker."""
+    e = row["entry"]
+    enr = e.get("enrichment") or {}
+    cur = e.get("curation") or {}
+    ident = _identity_string(enr)[:_GRID_W_ID]
+    runner = (enr.get("runner") or "")[:_GRID_W_RUN]
+    quant = (enr.get("quantization") or "—")[:_GRID_W_QUANT]
+    size_h = _human_size(e.get("size") or 0)
+    updated = (enr.get("last_modified") or "")[:_GRID_W_UPD]
+    ct = enr.get("chat_template")
+    ct_short = (ct[:8] if ct else "")
+    decision = (cur.get("decision") or "—")[:_GRID_W_DEC]
+    bm = enr.get("base_model") or ""
+    if len(bm) > _GRID_W_FROM:
+        bm = bm[:_GRID_W_FROM - 1] + "…"
+    cells = []
+    for tc in tool_codes:
+        if tc in row["stored_tools"]:
+            cells.append("●")
+        elif tc in row["compat_tools"]:
+            cells.append("✓")
+        else:
+            cells.append(" ")
+    tool_marks = " ".join(f"{c:^2}" for c in cells)
+    return (
+        f"{ident:<{_GRID_W_ID}} {runner:<{_GRID_W_RUN}} {quant:<{_GRID_W_QUANT}} "
+        f"{size_h:>{_GRID_W_SIZE}} {updated:<{_GRID_W_UPD}} {ct_short:<{_GRID_W_CT}} "
+        f"{tool_marks}  {decision:<{_GRID_W_DEC}} {bm}"
+    )
 
+def format_curation_grid(sections, ad_hoc):
+    """Render a per-purpose static text grid of every model in the inventory.
+
+    Rows are grouped by enrichment.purpose, sorted recommended-first via
+    the 10-level _grid_sort_key_for_pair hierarchy. Each row shows identity
+    + key metadata + a small grid of tool-compat marks:
+
+      ●  this tool currently has the bytes locally
+      ✓  this tool can natively load this runner, but the bytes aren't
+         in its local store on this machine
+      ' ' this tool isn't compatible with this runner
+    """
+    rows = compute_curation_grid_data(sections, ad_hoc)
+    tool_codes = [tc for tc, _ in _TOOL_COLUMNS]
+    tool_header = " ".join(f"{tc:^2}" for tc in tool_codes)
+    out = ["", "=" * 132, "Curation grid — by purpose, recommended first per group", "=" * 132]
+    for r in rows:
+        if r["kind"] == "header":
+            out.append("")
             out.append(
-                f"  {ident:<{W_ID}} {runner:<{W_RUN}} {quant:<{W_QUANT}} {size_h:>{W_SIZE}} "
-                f"{updated:<{W_UPD}} {ct_short:<{W_CT}} {tool_marks}  {decision:<{W_DEC}} {bm}"
+                f"[{r['purpose'].upper()}] · {r['n']} entries · {_human_size(r['size'])} · "
+                f"{r['keepers']} keep · {r['prunes']} prune"
             )
-
-    # Legend.
+            out.append(
+                f"  {'Identity':<{_GRID_W_ID}} {'Runner':<{_GRID_W_RUN}} "
+                f"{'Quant':<{_GRID_W_QUANT}} {'Size':>{_GRID_W_SIZE}} "
+                f"{'Updated':<{_GRID_W_UPD}} {'CT':<{_GRID_W_CT}} {tool_header}  "
+                f"{'Decision':<{_GRID_W_DEC}} From"
+            )
+            out.append("  " + "─" * 150)
+        else:
+            out.append("  " + _format_grid_row_content(r, tool_codes))
     out.append("")
     out.append("Legend:  ● stored locally in this tool  ·  ✓ compatible (could be loaded if present)")
     out.append("Tools:   " + " · ".join(f"{tc}={name}" for tc, name in _TOOL_COLUMNS))
-
     return "\n".join(out)
 
-def discover(hub_meta=False, curate=False):
+def mark_for_curation(grid_rows):
+    """Interactive picker: navigate the curation grid and mark each row.
+
+    Per-row marker semantics:
+      ●  default suggestion: keep    (curation said "keep")
+      ○  default suggestion: delete  (curation said "supersede" / "redundant")
+      ·  default suggestion: neutral (no curation decision)
+      ✓  user explicitly confirms keep
+      ✕  user explicitly confirms delete  (the ONLY mark that triggers action)
+
+    Defaults are non-destructive — only ✕ rows are returned for deletion.
+    The user has to opt in to every prune.
+
+    Keys:
+      ↑ / ↓     navigate (skips section headers)
+      SPACE     cycle through default → ✓ → ✕ → default → ...
+      Y         set ✓
+      N         set ✕
+      DEL       reset to default ●/○/·
+      ENTER     confirm and return marked-✕ rows
+      Ctrl-C    cancel (returns nothing)
+
+    Returns the list of grid_rows (entry rows) the user marked with ✕.
+    """
+    # Translate curation decisions into the default state per row.
+    def _default_state(entry):
+        cur = entry.get("curation") or {}
+        d = cur.get("decision")
+        if d == "keep":
+            return "keep"
+        if d in ("supersede", "redundant"):
+            return "delete"
+        return "neutral"
+
+    # Initial state per entry row: None = no user override, show default.
+    states = [None] * len(grid_rows)
+    defaults = [
+        _default_state(r["entry"]) if r["kind"] == "entry" else None
+        for r in grid_rows
+    ]
+
+    selectable = [i for i, r in enumerate(grid_rows) if r["kind"] == "entry"]
+    if not selectable:
+        return []
+    idx = selectable[0]
+
+    tool_codes = [tc for tc, _ in _TOOL_COLUMNS]
+    tool_header = " ".join(f"{tc:^2}" for tc in tool_codes)
+
+    def _marker(i):
+        if grid_rows[i]["kind"] != "entry":
+            return None
+        u = states[i]
+        if u == "keep":
+            return "✓"
+        if u == "delete":
+            return "✕"
+        d = defaults[i]
+        if d == "keep":
+            return "●"
+        if d == "delete":
+            return "○"
+        return "·"
+
+    while True:
+        print("\033[H\033[J", end="")
+        print("Curation — mark for keep ✓ / delete ✕  (only ✕ deletes; defaults ●/○/· are no-ops)")
+        print("  ↑/↓ navigate · SPACE cycle · Y keep · N delete · DEL unmark · ENTER confirm · Ctrl+C cancel")
+
+        # Live counts at the top so user sees pending impact.
+        n_delete = sum(1 for s in states if s == "delete")
+        n_keep = sum(1 for s in states if s == "keep")
+        n_size_to_delete = sum(
+            grid_rows[i]["entry"]["size"] or 0
+            for i, s in enumerate(states)
+            if s == "delete"
+        )
+        print(
+            f"  marked: ✕ delete = {n_delete} ({_human_size(n_size_to_delete)}), "
+            f"✓ keep = {n_keep}"
+        )
+
+        window_size = max(8, os.get_terminal_size().lines - 6)
+        total = len(grid_rows)
+        start = max(0, min(idx - window_size + 4, total - window_size))
+        end = min(start + window_size, total)
+        for i in range(start, end):
+            r = grid_rows[i]
+            cursor = ">" if i == idx else " "
+            if r["kind"] == "header":
+                # Section banner: blank line then bracketed title with stats.
+                print()
+                print(
+                    f"{cursor} [{r['purpose'].upper()}] · {r['n']} entries · "
+                    f"{_human_size(r['size'])} · {r['keepers']} keep · {r['prunes']} prune"
+                )
+                # Inline column header for the section, for orientation.
+                print(
+                    f"     {'Identity':<{_GRID_W_ID}} {'Runner':<{_GRID_W_RUN}} "
+                    f"{'Quant':<{_GRID_W_QUANT}} {'Size':>{_GRID_W_SIZE}} "
+                    f"{'Updated':<{_GRID_W_UPD}} {'CT':<{_GRID_W_CT}} {tool_header}  "
+                    f"{'Decision':<{_GRID_W_DEC}} From"
+                )
+            else:
+                m = _marker(i) or " "
+                content = _format_grid_row_content(r, tool_codes)
+                print(f"{cursor} {m} {content}")
+
+        key = get_key()
+        if key in ("\x1b[A",):  # Up arrow
+            new_idx = idx - 1
+            while new_idx >= 0 and grid_rows[new_idx]["kind"] != "entry":
+                new_idx -= 1
+            if new_idx >= 0:
+                idx = new_idx
+        elif key in ("\x1b[B",):  # Down arrow
+            new_idx = idx + 1
+            while new_idx < total and grid_rows[new_idx]["kind"] != "entry":
+                new_idx += 1
+            if new_idx < total:
+                idx = new_idx
+        elif key in ("\x1b[5~",):  # PageUp
+            for _ in range(window_size - 2):
+                ni = idx - 1
+                while ni >= 0 and grid_rows[ni]["kind"] != "entry":
+                    ni -= 1
+                if ni < 0:
+                    break
+                idx = ni
+        elif key in ("\x1b[6~",):  # PageDown
+            for _ in range(window_size - 2):
+                ni = idx + 1
+                while ni < total and grid_rows[ni]["kind"] != "entry":
+                    ni += 1
+                if ni >= total:
+                    break
+                idx = ni
+        elif key == " ":
+            # Cycle: None → keep → delete → None
+            cur = states[idx]
+            states[idx] = {None: "keep", "keep": "delete", "delete": None}[cur]
+        elif key.lower() == "y":
+            states[idx] = "keep"
+        elif key.lower() == "n":
+            states[idx] = "delete"
+        elif key in ("\x7f", "\x1b[3~"):  # Backspace OR Delete
+            states[idx] = None
+        elif key == "\r":
+            break
+        elif key == "\x03":
+            print("\nCancelled. No deletions.")
+            return []
+
+    return [
+        grid_rows[i] for i, s in enumerate(states)
+        if s == "delete" and grid_rows[i]["kind"] == "entry"
+    ]
+
+def discover(hub_meta=False, curate=False, interactive=False):
     """Inventory HF-compatible models cached by other apps on this machine."""
     cache_dir = Path(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")))
     hub_dir = cache_dir / "hub"
@@ -2494,7 +2674,29 @@ def discover(hub_meta=False, curate=False):
     print(format_discovery_report(sections, ad_hoc, len(mdfind_results), already_known, mdfind_note))
 
     if curate:
-        print(format_curation_grid(sections, ad_hoc))
+        if interactive:
+            grid_rows = compute_curation_grid_data(sections, ad_hoc)
+            marked = mark_for_curation(grid_rows)
+            # Move below the picker's last frame.
+            print("\033[H\033[J", end="")
+            if not marked:
+                print("No entries marked for deletion. (Defaults ●/○/· are non-destructive.)")
+            else:
+                total = sum(m["entry"]["size"] or 0 for m in marked)
+                print(f"Marked for deletion: {len(marked)} entr{'y' if len(marked) == 1 else 'ies'} · {_human_size(total)}")
+                print()
+                for m in marked:
+                    e = m["entry"]
+                    enr = e.get("enrichment") or {}
+                    print(
+                        f"  ✕ {_identity_string(enr)[:60]} "
+                        f"· {_human_size(e.get('size') or 0)} "
+                        f"· {e.get('id') or ''}"
+                    )
+                print()
+                print("(deletion not yet implemented; this is the list that would be removed.)")
+        else:
+            print(format_curation_grid(sections, ad_hoc))
 
 
 def main():
@@ -2570,6 +2772,14 @@ def main():
         action="store_true",
         help="Append a family-grouped curation view sorted most-recommended-first per group, with keep / supersede / redundant decisions. Combine with --hub-meta for date-aware decisions.",
     )
+    d.add_argument(
+        "--interactive",
+        action="store_true",
+        help="With --curate, show an interactive picker (cursor + ●/○/✓/✕ markers) "
+             "instead of the static grid. SPACE cycles a row through keep/delete/unmark; "
+             "Y/N/DEL set state directly; ENTER confirms. Only ✕ marks delete; "
+             "default ●/○ suggestions are non-destructive.",
+    )
     args = parser.parse_args()
     if args.cmd == "mirror":
         types = {"mlx", "gguf"} if args.type == "both" else {args.type}
@@ -2581,6 +2791,7 @@ def main():
         discover(
             hub_meta=args.hub_meta or args.curate,
             curate=args.curate,
+            interactive=args.interactive,
         )
     else:
         manage_models()
