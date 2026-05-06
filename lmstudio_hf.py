@@ -1757,6 +1757,53 @@ _DECISION_TAG = {
     None:        "indeterminate",
 }
 
+# Short codes used as column headers in the curation grid. Order is the
+# render order. HF is listed first because it's the canonical store and
+# many tools draw from it.
+_TOOL_COLUMNS = [
+    ("HF",  "Hugging Face cache"),
+    ("LM",  "LM Studio"),
+    ("OL",  "Ollama"),
+    ("MS",  "Msty family"),       # Msty / Msty Claw / MstyStudio share the column
+    ("CU",  "ComfyUI"),
+    ("DT",  "Draw Things"),
+    ("DB",  "Diffusion Bee"),
+]
+
+# Which on-disk section's app maps to which column.
+_APP_TO_TOOL = {
+    "Hugging Face cache":  "HF",
+    "LM Studio":           "LM",
+    "Ollama":              "OL",
+    "Msty":                "MS",
+    "Msty Claw":           "MS",
+    "MstyStudio":          "MS",
+    "ComfyUI":             "CU",
+    "Draw Things":         "DT",
+    "Diffusion Bee":       "DB",
+}
+
+# Which tools can natively use which runners. Used to mark "compatible"
+# (✓) cells in addition to "currently stored here" (●) cells.
+_RUNNER_COMPAT = {
+    # mlx safetensors run by LM Studio's mlx engine and by mlx-lm/mlx_vlm
+    # which read directly from HF cache.
+    "mlx":          {"HF", "LM"},
+    # mflux is FLUX/diffusion on Apple Silicon — typically reads HF cache.
+    "mflux":        {"HF"},
+    # diffusers read by ComfyUI and many MFLUX-style runners.
+    "diffusers":    {"HF", "CU"},
+    # transformers Python — runs from HF cache; LM Studio usually wants
+    # the MLX-converted version, but many transformers checkpoints work.
+    "transformers": {"HF"},
+    # gguf is consumed by LM Studio's llama.cpp engine, by Ollama, and by
+    # all the Ollama-format apps in the Msty family.
+    "gguf":         {"HF", "LM", "OL", "MS"},
+    # Drawthings uses its own .ckpt repack format; only Draw Things itself
+    # can load these.
+    "drawthings":   {"DT"},
+}
+
 def format_curation_view(sections, ad_hoc):
     """Render entries grouped by (family, size, moe), sorted recommended-first.
 
@@ -1871,6 +1918,178 @@ def format_curation_view(sections, ad_hoc):
                 continue
             sub = sum(e["size"] for _, e in lst)
             out.append(f"  {d}: {len(lst)} · {_human_size(sub)}")
+    return "\n".join(out)
+
+_PURPOSE_DISPLAY_ORDER = (
+    "instruct",
+    "coder",
+    "reasoning",
+    "embedding",
+    "asr",
+    "vision-output",
+    "video-output",
+    "base",
+    "other",
+)
+
+def _identity_string(enr):
+    """Compose a compact identity string from enrichment fields."""
+    parts = []
+    if enr.get("family"):
+        parts.append(enr["family"])
+    if enr.get("version"):
+        parts.append(enr["version"])
+    if enr.get("size"):
+        parts.append(enr["size"])
+    if enr.get("moe_active"):
+        parts.append(enr["moe_active"])
+    parts.append(enr.get("alignment") or "vanilla")
+    if enr.get("capabilities"):
+        parts.append("+".join(enr["capabilities"]))
+    return " ".join(parts) if parts else "(unknown)"
+
+def format_curation_grid(sections, ad_hoc):
+    """Render a per-purpose grid of every model in the inventory.
+
+    Rows are grouped by enrichment.purpose. Within each group, rows are
+    sorted recommended-first via _curation_sort_key. Each row shows
+    identity + key metadata + a small grid of tool-compat marks:
+
+      ●  this tool currently has the bytes locally
+      ✓  this tool can natively load this runner, but the bytes aren't
+         in its local store on this machine
+      ' ' this tool isn't compatible with this runner
+
+    Two passes:
+
+      1. Collect every entry that survives our curation filter (proprietary
+         entries are kept here so the user sees them; ollama_blob entries
+         are kept; LM Studio symlinked-into-HF entries are merged into the
+         HF cache row by aggregating their tool marks instead of dropping
+         the entry outright).
+      2. For each kept HF cache entry, look up the LM Studio entries with
+         matching id; if any are symlinked, the row's "LM" cell upgrades
+         from ✓ to ●.
+    """
+    # Build a quick lookup: id -> {app names that hold a copy} so we can
+    # merge HF cache + LM Studio symlinked etc. without dropping entries.
+    id_to_apps = {}
+    for s in sections:
+        if s["status"] != "scanned":
+            continue
+        for e in s["items"]:
+            eid = e.get("id") or ""
+            if eid:
+                id_to_apps.setdefault(eid, set()).add(s["app"])
+
+    # Collect entries for the grid. Skip LM Studio symlinked entries —
+    # they're a view of an HF cache entry that we'll mark via id_to_apps.
+    grid_entries = []
+    for s in sections:
+        if s["status"] != "scanned":
+            continue
+        for e in s["items"]:
+            if s["app"] == "LM Studio" and e.get("extra", {}).get("symlinked"):
+                continue
+            grid_entries.append((s["app"], e))
+    for a in ad_hoc:
+        if (a.get("enrichment") or {}).get("family"):
+            grid_entries.append(("(ad-hoc)", a))
+
+    # Apply curation tags to every kept entry.
+    curate_entries([e for _app, e in grid_entries])
+
+    # Bucket by purpose. Entries with no detectable purpose go into "other"
+    # rather than silently defaulting to instruct — Draw Things' proprietary
+    # vision/encoder/VAE components, embedding-only models without HF tags,
+    # and similar all land here for honest inspection.
+    by_purpose = {}
+    for app, e in grid_entries:
+        purpose = (e.get("enrichment") or {}).get("purpose") or "other"
+        by_purpose.setdefault(purpose, []).append((app, e))
+
+    out = ["", "=" * 132, "Curation grid — by purpose, recommended first per group", "=" * 132]
+
+    tool_codes = [tc for tc, _ in _TOOL_COLUMNS]
+    tool_header = " ".join(f"{tc:^2}" for tc in tool_codes)
+
+    purposes = list(_PURPOSE_DISPLAY_ORDER) + sorted(p for p in by_purpose if p not in _PURPOSE_DISPLAY_ORDER)
+
+    for purpose in purposes:
+        members = by_purpose.get(purpose) or []
+        if not members:
+            continue
+        # Sort within a purpose group: family alphabetical first so every
+        # entry for one family stays together; within a family the existing
+        # recommendation tuple takes over (newer version, vanilla before
+        # alignment, higher precision, mlx > gguf, more recently updated).
+        def _grid_key(pair):
+            _app, e = pair
+            fam = ((e.get("enrichment") or {}).get("family") or "~").lower()
+            return (fam,) + _curation_sort_key(e)
+        members.sort(key=_grid_key)
+        n = len(members)
+        total = sum(e["size"] for _, e in members)
+        keepers = sum(1 for _, e in members if (e.get("curation") or {}).get("decision") == "keep")
+        prunes = sum(1 for _, e in members if (e.get("curation") or {}).get("decision") in ("supersede", "redundant"))
+
+        out.append("")
+        out.append(f"[{purpose.upper()}] · {n} entries · {_human_size(total)} · {keepers} keep · {prunes} prune")
+        out.append(
+            f"  {'Identity':<46} {'Runner':<10} {'Quant':<7} {'Size':>7} {'Updated':<11} {'CT':<8} "
+            f"{tool_header}  Decision"
+        )
+        out.append("  " + "─" * 130)
+
+        for app, e in members:
+            enr = e.get("enrichment") or {}
+            cur = e.get("curation") or {}
+            ident = _identity_string(enr)[:46]
+            runner = enr.get("runner") or ""
+            quant = enr.get("quantization") or "—"
+            size_h = _human_size(e.get("size") or 0)
+            updated = enr.get("last_modified") or ""
+            ct = enr.get("chat_template")
+            ct_short = ct[:8] if ct else ""
+            decision = cur.get("decision") or "—"
+
+            # Determine tool marks for this row. ● means stored, ✓ means
+            # compatible-but-not-stored.
+            stored_tools = set()
+            for app_name in id_to_apps.get(e.get("id") or "", set()):
+                tc = _APP_TO_TOOL.get(app_name)
+                if tc:
+                    stored_tools.add(tc)
+            tc_for_app = _APP_TO_TOOL.get(app)
+            if tc_for_app:
+                stored_tools.add(tc_for_app)
+            compat_tools = set(_RUNNER_COMPAT.get(runner, set()))
+
+            row_tool_cells = []
+            for tc in tool_codes:
+                if tc in stored_tools:
+                    cell = "●"
+                elif tc in compat_tools:
+                    cell = "✓"
+                else:
+                    cell = " "
+                row_tool_cells.append(f"{cell:^2}")
+            tool_marks = " ".join(row_tool_cells)
+
+            out.append(
+                f"  {ident:<46} {runner:<10} {quant:<7} {size_h:>7} {updated:<11} {ct_short:<8} "
+                f"{tool_marks}  {decision}"
+            )
+            # Show base_model lineage as a faint sub-line where present.
+            bm = enr.get("base_model")
+            if bm:
+                out.append(f"      └─ from {bm}")
+
+    # Legend.
+    out.append("")
+    out.append("Legend:  ● stored locally in this tool  ·  ✓ compatible (could be loaded if present)")
+    out.append("Tools:   " + " · ".join(f"{tc}={name}" for tc, name in _TOOL_COLUMNS))
+
     return "\n".join(out)
 
 def discover(hub_meta=False, curate=False):
@@ -2085,7 +2304,7 @@ def discover(hub_meta=False, curate=False):
     print(format_discovery_report(sections, ad_hoc, len(mdfind_results), already_known, mdfind_note))
 
     if curate:
-        print(format_curation_view(sections, ad_hoc))
+        print(format_curation_grid(sections, ad_hoc))
 
 
 def main():
