@@ -477,18 +477,199 @@ def _friendly(path):
     return s
 
 def _dir_size(path):
-    """Sum file sizes under path, following symlinks. Tolerates errors."""
+    """Sum file sizes under path, deduplicated by inode.
+
+    HF cache snapshots are symlinks into the same blobs/, so naive
+    rglob+stat double-counts every file. Track (st_dev, st_ino) and
+    only count each unique inode once.
+    """
     total = 0
+    seen = set()
     try:
         for p in path.rglob("*"):
             try:
-                if p.is_file():
-                    total += p.stat().st_size
+                if not p.is_file():
+                    continue
+                st = p.stat()
+                key = (st.st_dev, st.st_ino)
+                if key in seen:
+                    continue
+                seen.add(key)
+                total += st.st_size
             except OSError:
                 continue
     except Exception:
         pass
     return total
+
+_QUANT_TIER = {
+    # Full precision baseline
+    "bf16": "fp", "fp16": "fp",
+    # 8-bit tier
+    "8bit": "8bit", "q8_0": "8bit", "q8p": "8bit",
+    "mxfp8": "8bit", "mixed-9bit": "8bit", "9bit": "8bit",
+    # 6-bit tier
+    "6bit": "6bit", "q6_k": "6bit", "q6p": "6bit",
+    # 5-bit tier
+    "5bit": "5bit", "q5_k_m": "5bit", "mixed-5bit": "5bit",
+    # 4-bit tier
+    "4bit": "4bit", "q4_k_m": "4bit", "q4_k_s": "4bit",
+    "iq4": "4bit", "nvfp4": "4bit", "mixed-4bit": "4bit",
+    # 3-bit tier
+    "3bit": "3bit", "iq3_m": "3bit",
+}
+
+def _quant_tier(quant):
+    """Bucket a fine-grained quantization into a coarse tier for keeper slots."""
+    if not quant:
+        return None
+    return _QUANT_TIER.get(quant, "other")
+
+def _family_group_key(entry):
+    """Hashable group key for curation: (family, size, moe_active).
+
+    Variants like instruct vs base, and different alignment tags, share a
+    group — that's the point. Different parameter sizes (4B vs 26B) and MoE
+    activation patterns (A4B vs A10B) are distinct groups, since those are
+    structurally different models.
+    """
+    enr = (entry.get("enrichment") or {})
+    family = enr.get("family")
+    if not family:
+        return None  # un-curatable; no family parsed
+    return (family, enr.get("size") or "", enr.get("moe_active") or "")
+
+def _version_float(enr):
+    if not enr:
+        return None
+    v = enr.get("version")
+    if not v:
+        return None
+    try:
+        return float(v)
+    except ValueError:
+        return None
+
+def _last_modified_days(enr):
+    """Days since 2000-01-01, or 0 if last_modified is missing."""
+    if not enr or not enr.get("last_modified"):
+        return 0
+    try:
+        from datetime import date
+        return (date.fromisoformat(enr["last_modified"]) - date(2000, 1, 1)).days
+    except Exception:
+        return 0
+
+def _format_rank(fmt):
+    return {"mlx": 0, "gguf": 1, "safetensors": 2}.get(fmt, 3)
+
+def _quant_tier_rank(tier):
+    return {"fp": 0, "8bit": 1, "6bit": 2, "5bit": 3, "4bit": 4, "3bit": 5, "other": 6, None: 7}[tier]
+
+def _curation_sort_key(entry):
+    """Return a tuple that sorts entries most-recommended-first.
+
+    Order:
+      1. Newer version first.
+      2. Vanilla (no alignment) before alignment-tagged (so the unmodified
+         model leads the list and the alignment variant follows in its slot).
+      3. Higher precision first (bf16 → 8bit → 6bit → 5bit → 4bit → 3bit).
+      4. MLX > GGUF > safetensors.
+      5. More recently updated first.
+      6. Alphabetical by id as a stable tiebreaker.
+    """
+    enr = entry.get("enrichment") or {}
+    version = _version_float(enr) or 0.0
+    has_alignment = 1 if enr.get("alignment") else 0
+    quant_tier = _quant_tier(enr.get("quantization"))
+    return (
+        -version,
+        has_alignment,
+        _quant_tier_rank(quant_tier),
+        _format_rank(enr.get("format")),
+        -_last_modified_days(enr),
+        entry.get("id") or "",
+    )
+
+def curate_entries(entries):
+    """Group entries by family and apply keep / supersede / redundant tags.
+
+    Mutates each entry in place by adding a `curation` field:
+        curation = {
+            "group": "<family> <size> <moe>",   # human label
+            "decision": "keep" | "supersede" | "redundant",
+            "slot": "<alignment>/<quant_tier>", # e.g. "vanilla/fp", "heretic/4bit"
+            "reason": str,
+        }
+
+    Decision rules:
+      - Group entries by (family, size, moe_active). Entries without a
+        parsed family are skipped (no curation tag added).
+      - Within a group, identify the highest version present. Anything
+        with a lower version is `supersede`.
+      - Within the top version, partition by (alignment ?: 'vanilla',
+        quant_tier). For each (alignment, tier) slot, the highest-ranked
+        entry (per _curation_sort_key) is `keep`; the rest in the same
+        slot are `redundant`.
+    """
+    by_group = {}
+    for e in entries:
+        key = _family_group_key(e)
+        if key is None:
+            continue
+        by_group.setdefault(key, []).append(e)
+
+    for (family, size, moe), members in by_group.items():
+        label = " ".join(p for p in (family, size, moe) if p) or family
+        # Highest version present in this group (or 0 if none have versions).
+        versions = [v for v in (_version_float(m.get("enrichment") or {}) for m in members) if v is not None]
+        top_version = max(versions) if versions else None
+
+        for m in sorted(members, key=_curation_sort_key):
+            enr = m.get("enrichment") or {}
+            v = _version_float(enr)
+            alignment = enr.get("alignment") or "vanilla"
+            tier = _quant_tier(enr.get("quantization")) or "other"
+            slot = f"{alignment}/{tier}"
+            decision = None
+            reason = None
+
+            if top_version is not None and v is not None and v < top_version:
+                decision = "supersede"
+                reason = f"version {v:g} < newest in family ({top_version:g})"
+            else:
+                # Within the top version: first entry per (alignment, tier)
+                # slot in sort order is the keeper; rest are redundant.
+                # We piggy-back on the per-group iteration order (already
+                # sorted) using a slot-seen marker stored on the group.
+                seen = m.setdefault("_curation_slot_seen", None)  # noqa
+                # Use a closure-local dict via the group instead.
+                pass
+
+            m["curation"] = {
+                "group": label,
+                "decision": decision,
+                "slot": slot,
+                "reason": reason,
+            }
+
+    # Second pass per group: assign keep / redundant within top-version slots.
+    # The _curation_slot_seen scratchpad above wasn't ideal; redo cleanly here.
+    for (family, size, moe), members in by_group.items():
+        sorted_members = sorted(members, key=_curation_sort_key)
+        slot_taken = set()
+        for m in sorted_members:
+            cur = m.get("curation")
+            if cur is None or cur["decision"] == "supersede":
+                continue
+            slot = cur["slot"]
+            if slot in slot_taken:
+                cur["decision"] = "redundant"
+                cur["reason"] = f"same slot ({slot}) already filled by a higher-ranked keeper"
+            else:
+                slot_taken.add(slot)
+                cur["decision"] = "keep"
+                cur["reason"] = "best in slot"
 
 def enrich_entry(entry, snapshot_path=None):
     """Augment a discovered-item record with parsed metadata.
@@ -700,7 +881,10 @@ def parse_model_id(repo_id):
     parts = repo_id.split("/")
     publisher = parts[0] if len(parts) >= 2 else None
     name = parts[-1]
-    s = name.lower()
+    # Search the full publisher/name. Publishers like "mlx-community" or
+    # "lmstudio-community" carry format and licensing signal that the model
+    # name alone wouldn't reveal.
+    s = repo_id.lower()
 
     out = {
         "publisher":    publisher,
@@ -728,8 +912,15 @@ def parse_model_id(repo_id):
     m = re.search(r"(?:^|[\-_ /])(\d+(?:\.\d+)?)\s*[bB](?:[\-_ ./]|$)", repo_id)
     if m:
         out["size"] = f"{m.group(1)}B"
+    else:
+        # Gemma-style "e4b" / "e2b" sub-billion edge variants — a
+        # parameter-class hint where the leading 'e' is part of the token,
+        # not a separator. Treat the whole thing as the size label.
+        m_e = re.search(r"(?:^|[\-_ /])([eE]\d+[bB])(?:[\-_ ./]|$)", repo_id)
+        if m_e:
+            out["size"] = m_e.group(1).upper()
 
-    m = re.search(r"[-_]A(\d+(?:\.\d+)?)B(?:[\-_/]|$)", repo_id)
+    m = re.search(r"[-_][Aa](\d+(?:\.\d+)?)[Bb](?:[\-_/]|$)", repo_id)
     if m:
         out["moe_active"] = f"A{m.group(1)}B"
 
@@ -1350,7 +1541,122 @@ def _enrich_with_hub_metadata(sections):
         enr["last_modified"] = meta["last_modified"]
         enr["license"] = meta["license"]
 
-def discover(hub_meta=False):
+_DECISION_TAG = {
+    "keep":      "keep",
+    "supersede": "supersede",
+    "redundant": "redundant",
+    None:        "indeterminate",
+}
+
+def format_curation_view(sections, ad_hoc):
+    """Render entries grouped by (family, size, moe), sorted recommended-first.
+
+    Includes scanned tool-storage entries (eligible: not proprietary, not
+    ollama_blob), plus ad-hoc finds whose name parses to a known family.
+    Entries with no family parsed go into an "Ungrouped" tail section.
+    """
+    entries = []
+    for s in sections:
+        if s["status"] != "scanned":
+            continue
+        for e in s["items"]:
+            # Skip Draw Things (proprietary) and Ollama-curated (ollama_blob)
+            # — neither is actionable through HF cache curation.
+            if e.get("status") in ("proprietary", "ollama_blob"):
+                continue
+            # An LM Studio dir whose contents are all symlinks IS a view of
+            # an HF cache snapshot already represented in curation; including
+            # it would duplicate every keep/redundant decision. Skip.
+            if s["app"] == "LM Studio" and e.get("extra", {}).get("symlinked"):
+                continue
+            entries.append((s["app"], e))
+    for a in ad_hoc:
+        # Promote ad-hoc finds with a parsed family into curation; else leave
+        # them in the ad-hoc bucket above. They keep their gather_candidate
+        # status; curation just adds the family-grouped ordering.
+        if (a.get("enrichment") or {}).get("family"):
+            entries.append(("(ad-hoc)", a))
+
+    # Run the curation decisions on the entry objects (in-place mutation).
+    curate_entries([e for _app, e in entries])
+
+    # Group for display.
+    by_group = {}
+    ungrouped = []
+    for app, e in entries:
+        cur = e.get("curation")
+        if cur is None:
+            ungrouped.append((app, e))
+            continue
+        by_group.setdefault(cur["group"], []).append((app, e))
+
+    out = ["", "=" * 78, "Curation view (recommended first per family group)", "=" * 78, ""]
+
+    # Sort groups: family asc, size desc-ish (parse the leading number),
+    # moe_active asc. Stable enough for readable output.
+    def _group_sort_key(label):
+        return label
+    for group_label in sorted(by_group, key=_group_sort_key):
+        members = by_group[group_label]
+        # Sort within group by curation order (already deterministic).
+        members.sort(key=lambda pair: _curation_sort_key(pair[1]))
+        n = len(members)
+        n_keep = sum(1 for _, e in members if (e.get("curation") or {}).get("decision") == "keep")
+        n_super = sum(1 for _, e in members if (e.get("curation") or {}).get("decision") == "supersede")
+        n_redund = sum(1 for _, e in members if (e.get("curation") or {}).get("decision") == "redundant")
+        total_size = sum(e["size"] for _, e in members)
+        out.append(f"[{group_label}]   {n} entr{'y' if n == 1 else 'ies'} · {_human_size(total_size)} · {n_keep} keep, {n_super} supersede, {n_redund} redundant")
+        for app, e in members:
+            cur = e.get("curation") or {}
+            decision = cur.get("decision")
+            decision_tag = _DECISION_TAG.get(decision, "")
+            slot = cur.get("slot") or "?"
+            id_str = e.get("id") or "(unnamed)"
+            size_str = _human_size(e.get("size") or 0)
+            enr = e.get("enrichment") or {}
+            meta_bits = []
+            if enr.get("variant"): meta_bits.append(enr["variant"])
+            if enr.get("alignment"): meta_bits.append(enr["alignment"])
+            if enr.get("format"): meta_bits.append(enr["format"])
+            if enr.get("quantization"): meta_bits.append(enr["quantization"])
+            if enr.get("chat_template"): meta_bits.append(f"ct:{enr['chat_template'][:8]}")
+            if enr.get("last_modified"): meta_bits.append(f"upd:{enr['last_modified']}")
+            meta = " · ".join(meta_bits) if meta_bits else ""
+            tag = f"[{decision_tag}]"
+            out.append(f"  {tag:<14} {app:<14} {id_str}")
+            out.append(f"      {size_str}   {slot}   {meta}")
+            if cur.get("reason") and decision in ("supersede", "redundant"):
+                out.append(f"      → {cur['reason']}")
+        out.append("")
+
+    if ungrouped:
+        out.append("[Ungrouped — no family parsed]")
+        for app, e in ungrouped:
+            id_str = e.get("id") or "(unnamed)"
+            size_str = _human_size(e.get("size") or 0)
+            out.append(f"  {app:<14} {id_str}   {size_str}")
+        out.append("")
+
+    # Rollup of prune candidates.
+    prune_items = []
+    for app, e in entries:
+        cur = e.get("curation") or {}
+        if cur.get("decision") in ("supersede", "redundant"):
+            prune_items.append((app, e, cur))
+    if prune_items:
+        total = sum(e["size"] for _, e, _ in prune_items)
+        out.append(f"Prune candidates: {len(prune_items)} entr{'y' if len(prune_items) == 1 else 'ies'} · {_human_size(total)} reclaimable")
+        by_decision = {"supersede": [], "redundant": []}
+        for app, e, cur in prune_items:
+            by_decision[cur["decision"]].append((app, e))
+        for d, lst in by_decision.items():
+            if not lst:
+                continue
+            sub = sum(e["size"] for _, e in lst)
+            out.append(f"  {d}: {len(lst)} · {_human_size(sub)}")
+    return "\n".join(out)
+
+def discover(hub_meta=False, curate=False):
     """Inventory HF-compatible models cached by other apps on this machine."""
     cache_dir = Path(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")))
     hub_dir = cache_dir / "hub"
@@ -1561,6 +1867,9 @@ def discover(hub_meta=False):
 
     print(format_discovery_report(sections, ad_hoc, len(mdfind_results), already_known, mdfind_note))
 
+    if curate:
+        print(format_curation_view(sections, ad_hoc))
+
 
 def main():
     """Entry point: dispatch the import (default), mirror, or discover subcommand."""
@@ -1630,12 +1939,17 @@ def main():
         action="store_true",
         help="Augment HF-derived entries with last_modified date and license from the Hugging Face Hub. One API call per unique repo_id.",
     )
+    d.add_argument(
+        "--curate",
+        action="store_true",
+        help="Append a family-grouped curation view sorted most-recommended-first per group, with keep / supersede / redundant decisions. Combine with --hub-meta for date-aware decisions.",
+    )
     args = parser.parse_args()
     if args.cmd == "mirror":
         types = {"mlx", "gguf"} if args.type == "both" else {args.type}
         mirror_to_huggingface(types, reuse_local=not args.no_reuse)
     elif args.cmd == "discover":
-        discover(hub_meta=args.hub_meta)
+        discover(hub_meta=args.hub_meta, curate=args.curate)
     else:
         manage_models()
 
